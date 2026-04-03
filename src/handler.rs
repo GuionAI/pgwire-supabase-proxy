@@ -3,11 +3,11 @@ use crate::error::ProxyError;
 use crate::pool::ConnectionManager;
 use async_trait::async_trait;
 use futures::{stream, Stream};
-use std::pin::Pin;
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use std::pin::Pin;
 use std::sync::Arc;
 
 const DEFAULT_ROW_LIMIT: usize = 1000;
@@ -26,12 +26,12 @@ impl ProxyQueryHandler {
             .metadata()
             .get(METADATA_USER_ID)
             .cloned()
-            .ok_or_else(|| PgWireError::ApiError(Box::new(ProxyError::InvalidStartup("no user_id".into()))))
+            .ok_or_else(|| {
+                PgWireError::ApiError(Box::new(ProxyError::InvalidStartup("no user_id".into())))
+            })
     }
 
-    fn exec_query(
-        messages: Vec<tokio_postgres::SimpleQueryMessage>,
-    ) -> Vec<Response> {
+    fn exec_query(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<Response> {
         let mut responses = Vec::new();
         let mut columns: Option<Arc<Vec<FieldInfo>>> = None;
         let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
@@ -97,9 +97,7 @@ impl ProxyQueryHandler {
         responses
     }
 
-    fn exec_command(
-        messages: Vec<tokio_postgres::SimpleQueryMessage>,
-    ) -> Vec<Response> {
+    fn exec_command(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<Response> {
         let mut rows_affected = 0u64;
 
         for msg in messages {
@@ -108,7 +106,9 @@ impl ProxyQueryHandler {
             }
         }
 
-        vec![Response::Execution(Tag::new("OK").with_rows(rows_affected as usize))]
+        vec![Response::Execution(
+            Tag::new("OK").with_rows(rows_affected as usize),
+        )]
     }
 }
 

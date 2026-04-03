@@ -22,8 +22,7 @@ impl AppFactory {
     fn new(jwt_secret: String, database_url: String, pool_size: usize) -> Self {
         let auth = Arc::new(JwtAuthenticator::new(jwt_secret));
         let param_provider = DefaultServerParameterProvider::default();
-        let startup =
-            Arc::new(StartupHandler::new(auth, Arc::new(param_provider)));
+        let startup = Arc::new(StartupHandler::new(auth, Arc::new(param_provider)));
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
         let query = Arc::new(ProxyQueryHandler::new(manager));
 
@@ -32,15 +31,11 @@ impl AppFactory {
 }
 
 impl PgWireServerHandlers for AppFactory {
-    fn startup_handler(
-        &self,
-    ) -> Arc<impl pgwire::api::auth::StartupHandler> {
+    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         self.startup.clone()
     }
 
-    fn simple_query_handler(
-        &self,
-    ) -> Arc<impl pgwire::api::query::SimpleQueryHandler> {
+    fn simple_query_handler(&self) -> Arc<impl pgwire::api::query::SimpleQueryHandler> {
         self.query.clone()
     }
 }
@@ -55,10 +50,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let jwt_secret =
-        std::env::var("SUPABASE_JWT_SECRET").expect("SUPABASE_JWT_SECRET must be set");
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let jwt_secret = std::env::var("SUPABASE_JWT_SECRET").expect("SUPABASE_JWT_SECRET must be set");
+    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let listen_addr: SocketAddr = std::env::var("LISTEN_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:5432".to_string())
         .parse()
@@ -79,9 +72,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         let factory_ref = factory.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                pgwire::tokio::process_socket(socket, None, factory_ref).await
-            {
+            if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
                 tracing::error!(error = %e, "connection error");
             }
         });

@@ -5,8 +5,8 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use pgwire::api::auth::ServerParameterProvider;
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
 use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
+use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -44,15 +44,19 @@ impl JwtAuthenticator {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
 
-        decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
-            .map_err(|e| {
-                tracing::debug!(error = %e, "JWT validation failed");
-                match e.kind() {
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => ProxyError::JwtExpired,
-                    _ => ProxyError::InvalidJwt(e.to_string()),
-                }
-            })
-            .map(|td| td.claims)
+        decode::<Claims>(
+            token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .map_err(|e| {
+            tracing::debug!(error = %e, "JWT validation failed");
+            match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => ProxyError::JwtExpired,
+                _ => ProxyError::InvalidJwt(e.to_string()),
+            }
+        })
+        .map(|td| td.claims)
     }
 }
 
@@ -63,7 +67,10 @@ pub struct StartupHandler<S: ServerParameterProvider> {
 
 impl<S: ServerParameterProvider> StartupHandler<S> {
     pub fn new(auth: Arc<JwtAuthenticator>, param_provider: Arc<S>) -> Self {
-        Self { auth, param_provider }
+        Self {
+            auth,
+            param_provider,
+        }
     }
 }
 
@@ -87,11 +94,7 @@ where
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo
-            + futures::Sink<PgWireBackendMessage>
-            + Unpin
-            + Send
-            + Sync,
+        C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: std::fmt::Debug,
         PgWireError: From<C::Error>,
     {
@@ -99,12 +102,9 @@ where
             return Ok(());
         };
 
-        let token = startup
-            .parameters
-            .get("user")
-            .ok_or_else(|| {
-                PgWireError::ApiError(Box::new(ProxyError::InvalidStartup("missing user".into())))
-            })?;
+        let token = startup.parameters.get("user").ok_or_else(|| {
+            PgWireError::ApiError(Box::new(ProxyError::InvalidStartup("missing user".into())))
+        })?;
 
         tracing::info!(
             user_prefix = %token.chars().take(20).collect::<String>(),
@@ -118,7 +118,9 @@ where
 
         tracing::info!(user_id = %claims.sub, "authenticated");
 
-        client.metadata_mut().insert(METADATA_USER_ID.to_string(), claims.sub.clone());
+        client
+            .metadata_mut()
+            .insert(METADATA_USER_ID.to_string(), claims.sub.clone());
         for (k, v) in &startup.parameters {
             client.metadata_mut().insert(k.clone(), v.clone());
         }
@@ -126,14 +128,16 @@ where
         client
             .send(PgWireBackendMessage::Authentication(Authentication::Ok))
             .await
-            .map_err(|e| PgWireError::from(e))?;
+            .map_err(PgWireError::from)?;
 
         if let Some(params) = self.param_provider.server_parameters(client) {
             for (k, v) in params {
                 client
-                    .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(k, v)))
+                    .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                        k, v,
+                    )))
                     .await
-                    .map_err(|e| PgWireError::from(e))?;
+                    .map_err(PgWireError::from)?;
             }
         }
 
@@ -143,14 +147,14 @@ where
                 SecretKey::I32(0),
             )))
             .await
-            .map_err(|e| PgWireError::from(e))?;
+            .map_err(PgWireError::from)?;
 
         client
             .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 TransactionStatus::Idle,
             )))
             .await
-            .map_err(|e| PgWireError::from(e))?;
+            .map_err(PgWireError::from)?;
         client.set_state(PgWireConnectionState::ReadyForQuery);
 
         Ok(())

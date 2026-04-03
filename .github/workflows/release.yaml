@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: clippy
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:${{ github.ref_name }}
+            registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:latest
+          cache-from: type=registry,ref=registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:latest
+          cache-to: type=inline

@@ -32,7 +32,10 @@ impl ConnectionManager {
         cfg.url = Some(self.db_url.clone());
         cfg.pool = Some(deadpool_postgres::PoolConfig::new(self.max_connections));
         let pool = cfg
-            .create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)
+            .create_pool(
+                Some(deadpool_postgres::Runtime::Tokio1),
+                tokio_postgres::NoTls,
+            )
             .map_err(|e| ProxyError::InvalidStartup(format!("failed to create pool: {}", e)))?;
 
         pools.push(user_id.to_string(), pool.clone());
@@ -45,14 +48,15 @@ impl ConnectionManager {
         let client = pool.get().await?;
 
         // Set role to authenticated (bypassrls=false → RLS applies)
-        client
-            .simple_query("SET ROLE authenticated")
-            .await?;
+        client.simple_query("SET ROLE authenticated").await?;
 
         // Set request.jwt.claim.sub so auth.uid() works
         let escaped_user_id = user_id.replace('\'', "''");
         client
-            .simple_query(&format!("SET request.jwt.claim.sub = '{}'", escaped_user_id))
+            .simple_query(&format!(
+                "SET request.jwt.claim.sub = '{}'",
+                escaped_user_id
+            ))
             .await?;
 
         tracing::debug!(user_id = %user_id, "RLS context set");

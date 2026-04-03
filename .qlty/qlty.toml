@@ -1,0 +1,36 @@
+# Code quality config — mirrors ttal-cli setup
+# https://qlty.sh/d/config
+config_version = "0"
+
+exclude_patterns = [
+  "**/target/**",
+  "**/vendor/**",
+]
+
+test_patterns = [
+  "**/tests/**",
+  "**/*_test.rs",
+]
+
+[smells]
+mode = "comment"
+
+[[source]]
+name = "default"
+default = true
+
+# Rust linter (clippy)
+[[plugin]]
+name = "clippy"
+
+# Dockerfile linter
+[[plugin]]
+name = "hadolint"
+
+# Dependency vulnerability scanning (Cargo.lock)
+[[plugin]]
+name = "osv-scanner"
+
+# Secret scanning
+[[plugin]]
+name = "trufflehog"
