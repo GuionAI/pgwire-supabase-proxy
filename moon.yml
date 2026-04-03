@@ -1,0 +1,37 @@
+$schema: 'https://moonrepo.dev/schemas/project.json'
+
+language: 'rust'
+
+fileGroups:
+  sources:
+    - 'src/**/*'
+    - 'Cargo.toml'
+    - 'Cargo.lock'
+
+tasks:
+  check:
+    script: |
+      cd dagger && dagger call check --source=../
+    inputs:
+      - '@group(sources)'
+      - 'dagger/**/*'
+    env:
+      _EXPERIMENTAL_DAGGER_RUNNER_HOST: 'tcp://dagger-engine-0.dagger-headless.devops.svc:8080'
+    options:
+      runInCI: true
+
+  push:
+    script: |
+      cd dagger && dagger call publish \
+        --source=../ \
+        --registry=${REGISTRY:-registry-docker-registry.devops.svc:5000} \
+        --image=${IMAGE_NAME:-pgwire-supabase-proxy} \
+        --tags=${IMAGE_TAGS:-latest}
+    inputs:
+      - '@group(sources)'
+      - 'dagger/**/*'
+      - 'Dockerfile'
+    env:
+      _EXPERIMENTAL_DAGGER_RUNNER_HOST: 'tcp://dagger-engine-0.dagger-headless.devops.svc:8080'
+    options:
+      runInCI: true
