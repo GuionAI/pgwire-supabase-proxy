@@ -1,4 +1,6 @@
 use crate::error::ProxyError;
+use crate::handler::SessionRegistry;
+use crate::pool::ConnectionManager;
 use async_trait::async_trait;
 use futures::SinkExt;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
@@ -63,13 +65,22 @@ impl JwtAuthenticator {
 pub struct StartupHandler<S: ServerParameterProvider> {
     auth: Arc<JwtAuthenticator>,
     param_provider: Arc<S>,
+    registry: Arc<SessionRegistry>,
+    manager: Arc<ConnectionManager>,
 }
 
 impl<S: ServerParameterProvider> StartupHandler<S> {
-    pub fn new(auth: Arc<JwtAuthenticator>, param_provider: Arc<S>) -> Self {
+    pub fn new(
+        auth: Arc<JwtAuthenticator>,
+        param_provider: Arc<S>,
+        registry: Arc<SessionRegistry>,
+        manager: Arc<ConnectionManager>,
+    ) -> Self {
         Self {
             auth,
             param_provider,
+            registry,
+            manager,
         }
     }
 }
@@ -79,6 +90,8 @@ impl<S: ServerParameterProvider + Clone + Send + Sync + 'static> Clone for Start
         Self {
             auth: self.auth.clone(),
             param_provider: self.param_provider.clone(),
+            registry: self.registry.clone(),
+            manager: self.manager.clone(),
         }
     }
 }
@@ -117,6 +130,22 @@ where
         })?;
 
         tracing::info!(user_id = %claims.sub, "authenticated");
+
+        // Acquire a backend connection and register it for this session.
+        // The connection is held for the lifetime of this frontend connection.
+        // Subsequent do_query calls will reuse this connection, preserving
+        // transaction state (BEGIN/COMMIT work correctly).
+        let client_key = client as *const C as u64;
+        match self.manager.check_out(&claims.sub).await {
+            Ok(conn) => {
+                self.registry.register(client_key, conn).await;
+                tracing::debug!(user_id = %claims.sub, "backend connection registered");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");
+                return Err(PgWireError::ApiError(Box::new(e)));
+            }
+        }
 
         client
             .metadata_mut()

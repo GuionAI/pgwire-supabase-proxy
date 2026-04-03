@@ -4,7 +4,7 @@ mod handler;
 mod pool;
 
 use crate::auth::{JwtAuthenticator, StartupHandler};
-use crate::handler::ProxyQueryHandler;
+use crate::handler::{ProxyQueryHandler, SessionRegistry};
 use crate::pool::ConnectionManager;
 use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::PgWireServerHandlers;
@@ -22,9 +22,15 @@ impl AppFactory {
     fn new(jwt_secret: String, database_url: String, pool_size: usize) -> Self {
         let auth = Arc::new(JwtAuthenticator::new(jwt_secret));
         let param_provider = DefaultServerParameterProvider::default();
-        let startup = Arc::new(StartupHandler::new(auth, Arc::new(param_provider)));
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
-        let query = Arc::new(ProxyQueryHandler::new(manager));
+        let registry = Arc::new(SessionRegistry::new());
+        let startup = Arc::new(StartupHandler::new(
+            auth,
+            Arc::new(param_provider),
+            registry.clone(),
+            manager.clone(),
+        ));
+        let query = Arc::new(ProxyQueryHandler::new(manager, registry.clone()));
 
         Self { startup, query }
     }
@@ -36,6 +42,10 @@ impl PgWireServerHandlers for AppFactory {
     }
 
     fn simple_query_handler(&self) -> Arc<impl pgwire::api::query::SimpleQueryHandler> {
+        self.query.clone()
+    }
+
+    fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
         self.query.clone()
     }
 }

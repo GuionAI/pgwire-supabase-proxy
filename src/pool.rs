@@ -64,6 +64,7 @@ impl ConnectionManager {
     }
 
     /// Discard all session state before returning connection to pool.
+    #[allow(dead_code)]
     pub async fn sanitize(client: &mut deadpool_postgres::Object) -> Result<(), ProxyError> {
         let _ = client.simple_query("DISCARD ALL").await;
         Ok(())
