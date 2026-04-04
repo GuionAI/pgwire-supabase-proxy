@@ -4,13 +4,14 @@ mod handler;
 mod pool;
 
 use crate::auth::{JwtAuthenticator, StartupHandler};
-use crate::handler::{ProxyQueryHandler, SessionRegistry};
+use crate::handler::ProxyQueryHandler;
 use crate::pool::ConnectionManager;
 use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::PgWireServerHandlers;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct AppFactory {
@@ -23,14 +24,14 @@ impl AppFactory {
         let auth = Arc::new(JwtAuthenticator::new(jwt_secret));
         let param_provider = DefaultServerParameterProvider::default();
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
-        let registry = Arc::new(SessionRegistry::new());
+        let conn: Arc<Mutex<Option<deadpool_postgres::Object>>> = Arc::new(Mutex::new(None));
         let startup = Arc::new(StartupHandler::new(
             auth,
             Arc::new(param_provider),
-            registry.clone(),
             manager.clone(),
+            conn.clone(),
         ));
-        let query = Arc::new(ProxyQueryHandler::new(manager, registry.clone()));
+        let query = Arc::new(ProxyQueryHandler::new(manager, conn.clone()));
 
         Self { startup, query }
     }

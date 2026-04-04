@@ -1,5 +1,4 @@
 use crate::error::ProxyError;
-use crate::handler::SessionRegistry;
 use crate::pool::ConnectionManager;
 use async_trait::async_trait;
 use futures::SinkExt;
@@ -12,7 +11,7 @@ use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus,
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
 
@@ -65,22 +64,24 @@ impl JwtAuthenticator {
 pub struct StartupHandler<S: ServerParameterProvider> {
     auth: Arc<JwtAuthenticator>,
     param_provider: Arc<S>,
-    registry: Arc<SessionRegistry>,
     manager: Arc<ConnectionManager>,
+    /// The backend connection for this socket. Set after successful JWT auth and
+    /// pool checkout. do_query reuses this connection; unregister_all DISCARDs it.
+    conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
 }
 
 impl<S: ServerParameterProvider> StartupHandler<S> {
     pub fn new(
         auth: Arc<JwtAuthenticator>,
         param_provider: Arc<S>,
-        registry: Arc<SessionRegistry>,
         manager: Arc<ConnectionManager>,
+        conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
     ) -> Self {
         Self {
             auth,
             param_provider,
-            registry,
             manager,
+            conn,
         }
     }
 }
@@ -90,8 +91,8 @@ impl<S: ServerParameterProvider + Clone + Send + Sync + 'static> Clone for Start
         Self {
             auth: self.auth.clone(),
             param_provider: self.param_provider.clone(),
-            registry: self.registry.clone(),
             manager: self.manager.clone(),
+            conn: self.conn.clone(),
         }
     }
 }
@@ -131,15 +132,12 @@ where
 
         tracing::info!(user_id = %claims.sub, "authenticated");
 
-        // Acquire a backend connection and register it for this session.
-        // The connection is held for the lifetime of this frontend connection.
-        // Subsequent do_query calls will reuse this connection, preserving
-        // transaction state (BEGIN/COMMIT work correctly).
-        let client_key = client as *const C as u64;
+        // Acquire a backend connection and store it for this socket.
+        // do_query reuses it for all queries; unregister_all DISCARDs it on disconnect.
         match self.manager.check_out(&claims.sub).await {
-            Ok(conn) => {
-                self.registry.register(client_key, conn).await;
-                tracing::debug!(user_id = %claims.sub, "backend connection registered");
+            Ok(c) => {
+                self.conn.lock().await.replace(c);
+                tracing::debug!(user_id = %claims.sub, "backend connection acquired");
             }
             Err(e) => {
                 tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");
