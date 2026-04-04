@@ -108,6 +108,7 @@ impl ProxyQueryHandler {
                     rows_count += 1;
 
                     if rows_count >= DEFAULT_ROW_LIMIT {
+                        tracing::warn!(count = rows_count, limit = DEFAULT_ROW_LIMIT, "result rows truncated");
                         break;
                     }
                 }
@@ -173,6 +174,7 @@ impl ProxyQueryHandler {
                     rows_count += 1;
 
                     if rows_count >= DEFAULT_ROW_LIMIT {
+                        tracing::warn!(count = rows_count, limit = DEFAULT_ROW_LIMIT, "result rows truncated");
                         break;
                     }
                 }
@@ -402,16 +404,7 @@ fn substitute_params(sql: &str, params: &[Option<Bytes>]) -> String {
                 num = num * 10 + (bytes[i] - b'0') as usize;
                 i += 1;
             }
-            if i > start + 1
-                && (i >= bytes.len()
-                    || bytes[i] == b' '
-                    || bytes[i] == b','
-                    || bytes[i] == b')'
-                    || bytes[i] == b';'
-                    || bytes[i] == b'\n'
-                    || bytes[i] == b'\r'
-                    || bytes[i] == b'\t')
-            {
+            if i > start + 1 && (i >= bytes.len() || !bytes[i].is_ascii_digit()) {
                 param_idx += 1;
                 if num == param_idx {
                     if let Some(Some(p)) = params.get(param_idx - 1) {
@@ -429,11 +422,10 @@ fn substitute_params(sql: &str, params: &[Option<Bytes>]) -> String {
                     result.push('$');
                     continue;
                 }
-            } else {
-                i = start + 1;
-                result.push('$');
-                continue;
             }
+            i = start + 1;
+            result.push('$');
+            continue;
         }
         result.push(bytes[i] as char);
         i += 1;
