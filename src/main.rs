@@ -11,11 +11,15 @@ use pgwire::api::PgWireServerHandlers;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct AppFactory {
     startup: Arc<StartupHandler<DefaultServerParameterProvider>>,
     query: Arc<ProxyQueryHandler>,
+    /// Stores the client_key after on_startup completes, so the outer scope
+    /// can unregister the session when this connection drops.
+    client_key: Arc<Mutex<Option<u64>>>,
 }
 
 impl AppFactory {
@@ -24,15 +28,21 @@ impl AppFactory {
         let param_provider = DefaultServerParameterProvider::default();
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
         let registry = Arc::new(SessionRegistry::new());
+        let client_key: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let startup = Arc::new(StartupHandler::new(
             auth,
             Arc::new(param_provider),
             registry.clone(),
             manager.clone(),
+            client_key.clone(),
         ));
         let query = Arc::new(ProxyQueryHandler::new(manager, registry.clone()));
 
-        Self { startup, query }
+        Self {
+            startup,
+            query,
+            client_key,
+        }
     }
 }
 
@@ -73,17 +83,26 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(addr = %listen_addr, "starting pgwire-supabase-proxy");
 
-    let factory = Arc::new(AppFactory::new(jwt_secret, database_url, pool_size));
     let listener = TcpListener::bind(listen_addr).await?;
 
     loop {
         let (socket, addr) = listener.accept().await?;
         tracing::info!(addr = %addr, "connection accepted");
 
-        let factory_ref = factory.clone();
+        let factory = Arc::new(AppFactory::new(
+            jwt_secret.clone(),
+            database_url.clone(),
+            pool_size,
+        ));
         tokio::spawn(async move {
-            if let Err(e) = pgwire::tokio::process_socket(socket, None, factory_ref).await {
+            let result = pgwire::tokio::process_socket(socket, None, factory.clone()).await;
+            if let Err(e) = result {
                 tracing::error!(error = %e, "connection error");
+            }
+            // After process_socket returns (client disconnected), unregister this
+            // connection's backend session so the connection is returned to the pool.
+            if let Some(key) = factory.client_key.lock().await.take() {
+                factory.query.unregister(key).await;
             }
         });
     }

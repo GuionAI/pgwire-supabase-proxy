@@ -12,7 +12,7 @@ use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus,
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
 
@@ -67,6 +67,9 @@ pub struct StartupHandler<S: ServerParameterProvider> {
     param_provider: Arc<S>,
     registry: Arc<SessionRegistry>,
     manager: Arc<ConnectionManager>,
+    /// Writes the client_key here after on_startup completes (connection authenticated).
+    /// The outer scope reads this after process_socket returns to unregister the session.
+    client_key: Arc<Mutex<Option<u64>>>,
 }
 
 impl<S: ServerParameterProvider> StartupHandler<S> {
@@ -75,12 +78,14 @@ impl<S: ServerParameterProvider> StartupHandler<S> {
         param_provider: Arc<S>,
         registry: Arc<SessionRegistry>,
         manager: Arc<ConnectionManager>,
+        client_key: Arc<Mutex<Option<u64>>>,
     ) -> Self {
         Self {
             auth,
             param_provider,
             registry,
             manager,
+            client_key,
         }
     }
 }
@@ -92,6 +97,7 @@ impl<S: ServerParameterProvider + Clone + Send + Sync + 'static> Clone for Start
             param_provider: self.param_provider.clone(),
             registry: self.registry.clone(),
             manager: self.manager.clone(),
+            client_key: self.client_key.clone(),
         }
     }
 }
@@ -140,6 +146,8 @@ where
             Ok(conn) => {
                 self.registry.register(client_key, conn).await;
                 tracing::debug!(user_id = %claims.sub, "backend connection registered");
+                // Signal the client_key to the outer scope so it can unregister on disconnect.
+                self.client_key.lock().await.replace(client_key);
             }
             Err(e) => {
                 tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");

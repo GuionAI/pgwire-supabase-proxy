@@ -96,6 +96,12 @@ impl ProxyQueryHandler {
         Self { manager, registry }
     }
 
+    /// Unregister a session's backend connection and return it to the pool.
+    /// Called when a client disconnects (after process_socket returns).
+    pub async fn unregister(&self, key: u64) {
+        self.registry.unregister(key).await;
+    }
+
     fn get_user_id<C: ClientInfo>(&self, client: &C) -> PgWireResult<String> {
         client
             .metadata()
