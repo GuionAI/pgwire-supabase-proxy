@@ -3,7 +3,7 @@ local k = import 'github.com/jsonnet-libs/k8s-libsonnet/1.29/main.libsonnet';
 {
   new(params):: {
     local name = 'pgwire-supabase-proxy',
-    local registry = 'registry-docker-registry.devops.svc:5000',
+    local registry = 'ghcr.io/guionai',
     local image = registry + '/pgwire-supabase-proxy:' + params.imageTag,
     local port = 5432,
 

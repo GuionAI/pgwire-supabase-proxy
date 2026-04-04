@@ -3,7 +3,7 @@ local pgwire = import '../../lib/pgwire.libsonnet';
 local params = {
   env: 'prod',
   namespace: 'supa-prod',
-  imageTag: 'latest',
+  imageTag: 'v0.1.1',
   imagePullPolicy: 'IfNotPresent',
 
   // CNPG pooler connection (flicknote-rw is in infra-prod, serves supabase db)
