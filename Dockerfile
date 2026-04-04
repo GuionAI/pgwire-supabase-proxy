@@ -1,4 +1,4 @@
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 WORKDIR /app
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
