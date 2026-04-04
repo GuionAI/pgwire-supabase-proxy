@@ -4,15 +4,24 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to push (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pgwire-supabase-proxy
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,22 +35,49 @@ jobs:
           targets: x86_64-unknown-linux-musl
           components: clippy
 
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl --toolchain stable
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value={{tag}}
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Run tests
         run: cargo test
 
       - name: Build binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: |
+          mkdir -p .cargo
+          echo '[target.x86_64-unknown-linux-musl]' >> .cargo/config.toml
+          echo 'linker = "musl-gcc"' >> .cargo/config.toml
+          cargo build --release --target x86_64-unknown-linux-musl
+          cp "target/x86_64-unknown-linux-musl/release/pgwire-supabase-proxy" target/release/pgwire-supabase-proxy
 
-      - name: Build Docker image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:${{ github.ref_name }}
-            registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:latest
-          cache-from: type=registry,ref=registry-docker-registry.devops.svc:5000/pgwire-supabase-proxy:latest
-          cache-to: type=inline
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
