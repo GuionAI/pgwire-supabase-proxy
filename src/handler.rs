@@ -19,29 +19,45 @@ use tokio::sync::Mutex;
 
 const DEFAULT_ROW_LIMIT: usize = 1000;
 
+/// Holds the backend Postgres connection for a client socket, shared between
+/// `StartupHandler` (sets it after auth) and `ProxyQueryHandler` (uses it for queries).
+///
+/// `Arc<Session>` lives for the socket lifetime. When the last `Arc` is dropped
+/// (after `process_socket` returns), `Drop` runs `DISCARD ALL` on the connection
+/// to prevent session state leaking to the next client that reuses it from the pool.
+pub struct Session {
+    pub(crate) inner: Arc<Mutex<Option<deadpool_postgres::Object>>>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl Drop for Session {
+    #[allow(clippy::let_underscore_future)]
+    fn drop(&mut self) {
+        let guard = self.inner.try_lock();
+        if let Ok(guard) = guard {
+            if let Some(conn) = guard.as_ref() {
+                let _ = conn.simple_query("DISCARD ALL");
+            }
+        }
+    }
+}
+
 /// Query handler that shares a single backend connection per socket.
-/// The connection is checked out in on_startup, reused for all queries, and
-/// DISCARD'd after the socket closes.
 pub struct ProxyQueryHandler {
     manager: Arc<ConnectionManager>,
-    /// The backend connection for this socket. Set in on_startup after JWT auth.
-    conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
+    session: Arc<Session>,
 }
 
 impl ProxyQueryHandler {
-    pub fn new(
-        manager: Arc<ConnectionManager>,
-        conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
-    ) -> Self {
-        Self { manager, conn }
-    }
-
-    /// Discard the backend connection and return it to the pool.
-    /// Called after process_socket returns (socket closed).
-    pub async fn unregister_all(&self) {
-        if let Some(c) = self.conn.lock().await.take() {
-            let _ = c.simple_query("DISCARD ALL").await;
-        }
+    pub fn new(manager: Arc<ConnectionManager>, session: Arc<Session>) -> Self {
+        Self { manager, session }
     }
 
     fn get_user_id<C: ClientInfo>(&self, client: &C) -> PgWireResult<String> {
@@ -200,7 +216,7 @@ impl ProxyQueryHandler {
 
 impl Clone for ProxyQueryHandler {
     fn clone(&self) -> Self {
-        Self::new(self.manager.clone(), self.conn.clone())
+        Self::new(self.manager.clone(), self.session.clone())
     }
 }
 
@@ -213,16 +229,30 @@ impl pgwire::api::query::SimpleQueryHandler for ProxyQueryHandler {
         let user_id = self.get_user_id(client)?;
         tracing::debug!(user_id = %user_id, query = %query, "do_query");
 
-        let backend = match self.conn.lock().await.take() {
+        let backend = {
+            let mut guard = self.session.inner.lock().await;
+            guard.take()
+        };
+
+        let backend = match backend {
             Some(c) => c,
-            None => self.manager.check_out(&user_id).await.map_err(|e| {
-                tracing::warn!(error = %e, "conn not set, using per-query checkout");
-                PgWireError::ApiError(Box::new(e))
-            })?,
+            None => {
+                tracing::warn!("session has no backend connection, checking out per-query");
+                self.manager
+                    .check_out(&user_id)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            }
         };
 
         let messages = backend.simple_query(query).await;
-        self.conn.lock().await.replace(backend);
+
+        {
+            let mut guard = self.session.inner.lock().await;
+            if guard.is_none() {
+                *guard = Some(backend);
+            }
+        }
 
         match messages {
             Ok(msgs) => {
@@ -275,25 +305,35 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let user_id = self.get_user_id(client)?;
+        let _user_id = self.get_user_id(client)?;
         let query = portal.statement.statement.clone();
-
-        let backend = match self.conn.lock().await.take() {
-            Some(c) => c,
-            None => self.manager.check_out(&user_id).await.map_err(|_| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "FATAL".into(),
-                    "50000".into(),
-                    "failed to acquire backend connection".into(),
-                )))
-            })?,
-        };
-
         let q = substitute_params(&query, &portal.parameters);
         let upper = query.trim().to_uppercase();
 
+        let backend = {
+            let mut guard = self.session.inner.lock().await;
+            guard.take()
+        };
+
+        let backend = match backend {
+            Some(c) => c,
+            None => {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".into(),
+                    "50000".into(),
+                    "no backend connection in session".into(),
+                ))));
+            }
+        };
+
         let messages = backend.simple_query(&q).await;
-        self.conn.lock().await.replace(backend);
+
+        {
+            let mut guard = self.session.inner.lock().await;
+            if guard.is_none() {
+                *guard = Some(backend);
+            }
+        }
 
         match messages {
             Ok(msgs) => {

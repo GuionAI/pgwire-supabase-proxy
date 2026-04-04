@@ -4,14 +4,13 @@ mod handler;
 mod pool;
 
 use crate::auth::{JwtAuthenticator, StartupHandler};
-use crate::handler::ProxyQueryHandler;
+use crate::handler::{ProxyQueryHandler, Session};
 use crate::pool::ConnectionManager;
 use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::PgWireServerHandlers;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct AppFactory {
@@ -24,14 +23,14 @@ impl AppFactory {
         let auth = Arc::new(JwtAuthenticator::new(jwt_secret));
         let param_provider = DefaultServerParameterProvider::default();
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
-        let conn: Arc<Mutex<Option<deadpool_postgres::Object>>> = Arc::new(Mutex::new(None));
+        let session: Arc<Session> = Arc::new(Session::new());
         let startup = Arc::new(StartupHandler::new(
             auth,
             Arc::new(param_provider),
             manager.clone(),
-            conn.clone(),
+            session.clone(),
         ));
-        let query = Arc::new(ProxyQueryHandler::new(manager, conn.clone()));
+        let query = Arc::new(ProxyQueryHandler::new(manager, session));
 
         Self { startup, query }
     }
@@ -90,9 +89,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             if let Err(e) = result {
                 tracing::error!(error = %e, "connection error");
             }
-            // After process_socket returns (client disconnected), unregister this
-            // connection's backend session so the connection is returned to the pool.
-            factory.query.unregister_all().await;
+            // Arc<AppFactory> is dropped here → Arc<Session> refcount hits 0
+            // → Session::drop runs → DISCARD ALL on the backend connection.
         });
     }
 }

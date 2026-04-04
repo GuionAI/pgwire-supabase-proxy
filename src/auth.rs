@@ -1,4 +1,5 @@
 use crate::error::ProxyError;
+use crate::handler::Session;
 use crate::pool::ConnectionManager;
 use async_trait::async_trait;
 use futures::SinkExt;
@@ -11,7 +12,7 @@ use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus,
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
 
@@ -65,9 +66,10 @@ pub struct StartupHandler<S: ServerParameterProvider> {
     auth: Arc<JwtAuthenticator>,
     param_provider: Arc<S>,
     manager: Arc<ConnectionManager>,
-    /// The backend connection for this socket. Set after successful JWT auth and
-    /// pool checkout. do_query reuses this connection; unregister_all DISCARDs it.
-    conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
+    /// Set once in `on_startup` after JWT auth. Shared (via Arc) with `ProxyQueryHandler`
+    /// so both handlers access the same backend connection. Dropped when the socket closes,
+    /// which triggers `Session::drop` → `DISCARD ALL`.
+    session: Arc<Session>,
 }
 
 impl<S: ServerParameterProvider> StartupHandler<S> {
@@ -75,13 +77,13 @@ impl<S: ServerParameterProvider> StartupHandler<S> {
         auth: Arc<JwtAuthenticator>,
         param_provider: Arc<S>,
         manager: Arc<ConnectionManager>,
-        conn: Arc<Mutex<Option<deadpool_postgres::Object>>>,
+        session: Arc<Session>,
     ) -> Self {
         Self {
             auth,
             param_provider,
             manager,
-            conn,
+            session,
         }
     }
 }
@@ -92,7 +94,7 @@ impl<S: ServerParameterProvider + Clone + Send + Sync + 'static> Clone for Start
             auth: self.auth.clone(),
             param_provider: self.param_provider.clone(),
             manager: self.manager.clone(),
-            conn: self.conn.clone(),
+            session: self.session.clone(),
         }
     }
 }
@@ -132,11 +134,9 @@ where
 
         tracing::info!(user_id = %claims.sub, "authenticated");
 
-        // Acquire a backend connection and store it for this socket.
-        // do_query reuses it for all queries; unregister_all DISCARDs it on disconnect.
         match self.manager.check_out(&claims.sub).await {
             Ok(c) => {
-                self.conn.lock().await.replace(c);
+                self.session.inner.lock().await.replace(c);
                 tracing::debug!(user_id = %claims.sub, "backend connection acquired");
             }
             Err(e) => {
