@@ -1,0 +1,14 @@
+target/
+vendor/
+.qlty/
+.github/
+dagger/
+tanka/
+.woodpecker/
+.git/
+*.md
+.env
+Cargo.lock
+Makefile
+moon.yml
+rustfmt.toml

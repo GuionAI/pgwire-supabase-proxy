@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Download dependencies
+        run: cargo fetch
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build
+        run: cargo build --release
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Download dependencies
+        run: cargo fetch
+
+      - name: Install qlty
+        run: |
+          curl -fsSL https://qlty.sh | QLTY_VERSION=0.618.0 bash
+          echo "$HOME/.qlty/bin" >> $GITHUB_PATH
+
+      - name: Lint and security scan
+        run: qlty check --all --no-progress

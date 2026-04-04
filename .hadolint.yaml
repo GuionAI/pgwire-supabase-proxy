@@ -1,0 +1,5 @@
+# hadolint configuration
+# https://github.com/hadolint/hadolint
+ignored:
+  - DL3008  # pin apt packages to specific version (we use slim base)
+  - DL3015  # avoid apt-get upgrade and auto-remove (we don't)
