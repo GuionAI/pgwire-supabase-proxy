@@ -53,13 +53,12 @@ JWT arrives in the pgwire `StartupMessage` `user` field. `JwtAuthenticator::vali
 
 - **Simple query**: `do_query` forwards via `simple_query`, detects SELECT vs. command, appends transaction state messages for `BEGIN`/`COMMIT`/`ROLLBACK`.
 - **Extended query**: `do_query` substitutes `$1`/`$2` placeholders (text format only) via `substitute_params`, then runs as a simple query. Binary parameters are not supported.
-- Row cap: 1000 rows (`DEFAULT_ROW_LIMIT`).
 
 ### Known limitations
 
-- `DISCARD ALL` on disconnect is not reliably wired (pgwire v0.38 lacks a disconnect hook) — connections accumulate until restart.
-- Extended query binary parameters not supported; clients must use text format.
-- JWT expiry mid-session causes a Postgres error; client must reconnect.
+- **Session cleanup is deferred**: `Session::drop` drops the `deadpool_postgres::Object`, returning it to the pool. `RecyclingMethod::Clean` runs `DISCARD ALL` at the *start of the next checkout*, not on disconnect. This is intentional — the next connection start does the cleanup.
+- **Extended query binary parameters not supported**: `substitute_params` assumes `Bytes` contains UTF-8 text. Binary-encoded parameters (e.g. raw integer bytes) are left unsubstituted. Not an issue for tch, which only sends `SqlParam::Text(String)` and `SqlParam::Null`.
+- **JWT expiry mid-session**: JWT is only validated at startup. If it expires during a session, the client must reconnect with a fresh token.
 
 ## Deployment
 

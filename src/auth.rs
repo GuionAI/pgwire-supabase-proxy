@@ -235,7 +235,7 @@ mod tests {
     async fn test_invalid_jwt() {
         let auth = JwtAuthenticator::new("test-secret".to_string());
         let result = auth.validate_token("invalid.token.here").await;
-        assert!(result.is_err());
+        assert!(matches!(result, Err(ProxyError::InvalidJwt(_))));
     }
 
     #[tokio::test]
@@ -246,5 +246,13 @@ mod tests {
         let auth = JwtAuthenticator::new(secret.to_string());
         let result = auth.validate_token(&token).await;
         assert!(matches!(result, Err(ProxyError::JwtExpired)));
+    }
+
+    #[tokio::test]
+    async fn test_wrong_secret_jwt() {
+        let token = make_test_token("correct-secret-32-chars-minimum", "user-123", 3600);
+        let auth = JwtAuthenticator::new("wrong-secret-32-chars-minimum!!".to_string());
+        let result = auth.validate_token(&token).await;
+        assert!(matches!(result, Err(ProxyError::InvalidJwt(_))));
     }
 }

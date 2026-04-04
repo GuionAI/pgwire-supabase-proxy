@@ -76,5 +76,6 @@ tk apply environments/dev # deploy
 ## Limitations
 
 - **Extended query binary parameters**: Not yet supported. Clients must use text format for parameters.
-- **Session cleanup**: The `DISCARD ALL` on disconnect is not wired — the pgwire library (v0.38) does not expose a disconnect hook. Connections accumulate until the proxy restarts. This is tracked for future attention.
+- **Session cleanup**: `DISCARD ALL` runs at the start of the next connection checkout via `RecyclingMethod::Clean`, not immediately on disconnect.
 - **Token refresh**: If the JWT expires mid-session, Postgres returns an error. The client must reconnect with a fresh token.
+- **Backslash escaping**: `substitute_params` escapes string literals assuming `standard_conforming_strings=on`. Do not point this proxy at a Postgres instance with that setting disabled.

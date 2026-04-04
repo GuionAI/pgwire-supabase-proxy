@@ -17,14 +17,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const DEFAULT_ROW_LIMIT: usize = 1000;
-
 /// Holds the backend Postgres connection for a client socket, shared between
 /// `StartupHandler` (sets it after auth) and `ProxyQueryHandler` (uses it for queries).
 ///
 /// `Arc<Session>` lives for the socket lifetime. When the last `Arc` is dropped
-/// (after `process_socket` returns), `Drop` runs `DISCARD ALL` on the connection
-/// to prevent session state leaking to the next client that reuses it from the pool.
+/// (after `process_socket` returns), `Drop` returns the connection to the pool.
+/// `RecyclingMethod::Clean` runs `DISCARD ALL` at the next checkout, preventing session state leaks.
 pub struct Session {
     pub(crate) inner: Arc<Mutex<Option<deadpool_postgres::Object>>>,
 }
@@ -106,11 +104,6 @@ impl ProxyQueryHandler {
                     }
                     data_rows.push(Ok(encoder.take_row()));
                     rows_count += 1;
-
-                    if rows_count >= DEFAULT_ROW_LIMIT {
-                        tracing::warn!(count = rows_count, limit = DEFAULT_ROW_LIMIT, "result rows truncated");
-                        break;
-                    }
                 }
                 tokio_postgres::SimpleQueryMessage::CommandComplete(_tag) => {}
                 _ => {}
@@ -172,11 +165,6 @@ impl ProxyQueryHandler {
                     }
                     data_rows.push(Ok(encoder.take_row()));
                     rows_count += 1;
-
-                    if rows_count >= DEFAULT_ROW_LIMIT {
-                        tracing::warn!(count = rows_count, limit = DEFAULT_ROW_LIMIT, "result rows truncated");
-                        break;
-                    }
                 }
                 _ => {}
             }
@@ -454,4 +442,134 @@ fn is_select_query(q: &str) -> bool {
         || q.starts_with("WITH")
         || q.starts_with("TABLE")
         || q.starts_with("VALUES")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── escape_pg_string ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_escape_single_quote() {
+        assert_eq!(escape_pg_string("it's fine"), "it''s fine");
+    }
+
+    #[test]
+    fn test_escape_backslash() {
+        assert_eq!(escape_pg_string("C:\\path"), "C:\\\\path");
+    }
+
+    #[test]
+    fn test_escape_newline() {
+        assert_eq!(escape_pg_string("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn test_escape_cr_tab() {
+        assert_eq!(escape_pg_string("a\rb\tc"), "a\\rb\\tc");
+    }
+
+    #[test]
+    fn test_escape_empty() {
+        assert_eq!(escape_pg_string(""), "");
+    }
+
+    #[test]
+    fn test_escape_no_special_chars() {
+        assert_eq!(escape_pg_string("hello world"), "hello world");
+    }
+
+    // ── substitute_params ─────────────────────────────────────────────────
+
+    fn p(s: &str) -> Option<Bytes> {
+        Some(Bytes::from(s.to_string()))
+    }
+
+    #[test]
+    fn test_substitute_basic() {
+        let sql = "SELECT * FROM t WHERE id = $1";
+        let result = substitute_params(sql, &[p("abc")]);
+        assert_eq!(result, "SELECT * FROM t WHERE id = 'abc'");
+    }
+
+    #[test]
+    fn test_substitute_quote_injection() {
+        let sql = "SELECT * FROM users WHERE name = $1";
+        let result = substitute_params(sql, &[p("O'Brien")]);
+        assert_eq!(result, "SELECT * FROM users WHERE name = 'O''Brien'");
+    }
+
+    #[test]
+    fn test_substitute_backslash() {
+        let sql = "SELECT $1";
+        let result = substitute_params(sql, &[p("a\\b")]);
+        assert_eq!(result, "SELECT 'a\\\\b'");
+    }
+
+    #[test]
+    fn test_substitute_multiple_params() {
+        let sql = "INSERT INTO t (a, b) VALUES ($1, $2)";
+        let result = substitute_params(sql, &[p("foo"), p("bar")]);
+        assert_eq!(result, "INSERT INTO t (a, b) VALUES ('foo', 'bar')");
+    }
+
+    #[test]
+    fn test_substitute_null_param_leaves_placeholder() {
+        let sql = "SELECT $1";
+        let result = substitute_params(sql, &[None]);
+        assert_eq!(result, "SELECT $1");
+    }
+
+    #[test]
+    fn test_substitute_no_params() {
+        let sql = "SELECT 1";
+        let result = substitute_params(sql, &[]);
+        assert_eq!(result, "SELECT 1");
+    }
+
+    #[test]
+    fn test_substitute_non_utf8_leaves_placeholder() {
+        let sql = "SELECT $1";
+        let bad_bytes = Some(Bytes::from(vec![0xFF, 0xFE]));
+        let result = substitute_params(sql, &[bad_bytes]);
+        assert_eq!(result, "SELECT $1");
+    }
+
+    #[test]
+    fn test_substitute_out_of_order_leaves_unsubstituted() {
+        // $2 before $1 — both left unsubstituted (sequential-only contract)
+        let sql = "SELECT $2, $1";
+        let result = substitute_params(sql, &[p("first"), p("second")]);
+        assert_eq!(result, "SELECT $2, $1");
+    }
+
+    #[test]
+    fn test_substitute_repeated_placeholder_second_unsubstituted() {
+        // $1 twice — only first substitution fires
+        let sql = "SELECT $1, $1";
+        let result = substitute_params(sql, &[p("val")]);
+        assert_eq!(result, "SELECT 'val', $1");
+    }
+
+    #[test]
+    fn test_substitute_type_cast_delimiter() {
+        // $1 followed by :: should be substituted
+        let sql = "SELECT $1::text";
+        let result = substitute_params(sql, &[p("hello")]);
+        assert_eq!(result, "SELECT 'hello'::text");
+    }
+
+    // ── is_select_query ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_select_query_variants() {
+        assert!(is_select_query("SELECT 1"));
+        assert!(is_select_query("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(is_select_query("TABLE users"));
+        assert!(is_select_query("VALUES (1, 2)"));
+        assert!(!is_select_query("INSERT INTO users VALUES (1)"));
+        assert!(!is_select_query("UPDATE users SET name = 'x'"));
+        assert!(!is_select_query("DELETE FROM users"));
+    }
 }

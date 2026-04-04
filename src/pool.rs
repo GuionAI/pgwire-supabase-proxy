@@ -52,11 +52,10 @@ impl ConnectionManager {
         client.simple_query("SET ROLE authenticated").await?;
 
         // Set request.jwt.claim.sub so auth.uid() works
-        let escaped_user_id = user_id.replace('\'', "''");
         client
             .simple_query(&format!(
                 "SET request.jwt.claim.sub = '{}'",
-                escaped_user_id
+                escape_user_id(user_id)
             ))
             .await?;
 
@@ -64,4 +63,30 @@ impl ConnectionManager {
         Ok(client)
     }
 
+}
+
+/// Escape a user_id for safe interpolation into a SET statement literal.
+pub(crate) fn escape_user_id(user_id: &str) -> String {
+    user_id.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_user_id_normal_uuid() {
+        let uid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(escape_user_id(uid), uid);
+    }
+
+    #[test]
+    fn test_escape_user_id_single_quote() {
+        assert_eq!(escape_user_id("user'123"), "user''123");
+    }
+
+    #[test]
+    fn test_escape_user_id_multiple_quotes() {
+        assert_eq!(escape_user_id("a'b'c"), "a''b''c");
+    }
 }
