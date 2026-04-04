@@ -19,10 +19,9 @@ struct AppFactory {
 }
 
 impl AppFactory {
-    fn new(jwt_secret: String, database_url: String, pool_size: usize) -> Self {
+    fn new(jwt_secret: String, manager: Arc<ConnectionManager>) -> Self {
         let auth = Arc::new(JwtAuthenticator::new(jwt_secret));
         let param_provider = DefaultServerParameterProvider::default();
-        let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
         let session: Arc<Session> = Arc::new(Session::new());
         let startup = Arc::new(StartupHandler::new(
             auth,
@@ -35,7 +34,6 @@ impl AppFactory {
         Self { startup, query }
     }
 }
-
 impl PgWireServerHandlers for AppFactory {
     fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
         self.startup.clone()
@@ -71,19 +69,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("invalid POOL_SIZE");
 
-    tracing::info!(addr = %listen_addr, "starting pgwire-supabase-proxy");
-
     let listener = TcpListener::bind(listen_addr).await?;
+
+    let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
+    tracing::info!(addr = %listen_addr, "starting pgwire-supabase-proxy");
 
     loop {
         let (socket, addr) = listener.accept().await?;
         tracing::info!(addr = %addr, "connection accepted");
 
-        let factory = Arc::new(AppFactory::new(
-            jwt_secret.clone(),
-            database_url.clone(),
-            pool_size,
-        ));
+        let factory = Arc::new(AppFactory::new(jwt_secret.clone(), manager.clone()));
         tokio::spawn(async move {
             let result = pgwire::tokio::process_socket(socket, None, factory.clone()).await;
             if let Err(e) = result {
