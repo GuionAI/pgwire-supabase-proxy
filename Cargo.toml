@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-lru = "0.12"
+lru = "0.16"
 
 [dev-dependencies]
 tokio-test = "0.4"
