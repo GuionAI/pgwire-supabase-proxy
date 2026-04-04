@@ -17,6 +17,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+struct ParsedMessages {
+    columns: Option<Arc<Vec<FieldInfo>>>,
+    data_rows: Vec<PgWireResult<DataRow>>,
+    rows_count: usize,
+}
+
 /// Holds the backend Postgres connection for a client socket, shared between
 /// `StartupHandler` (sets it after auth) and `ProxyQueryHandler` (uses it for queries).
 ///
@@ -109,7 +115,7 @@ impl ProxyQueryHandler {
     /// Parse raw `SimpleQueryMessage`s into columns + encoded rows.
     fn parse_messages(
         messages: Vec<tokio_postgres::SimpleQueryMessage>,
-    ) -> (Option<Arc<Vec<FieldInfo>>>, Vec<PgWireResult<DataRow>>, usize) {
+    ) -> ParsedMessages {
         let mut columns: Option<Arc<Vec<FieldInfo>>> = None;
         let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
         let mut rows_count = 0usize;
@@ -152,11 +158,11 @@ impl ProxyQueryHandler {
             }
         }
 
-        (columns, data_rows, rows_count)
+        ParsedMessages { columns, data_rows, rows_count }
     }
 
     fn exec_query(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<Response> {
-        let (columns, data_rows, rows_count) = Self::parse_messages(messages);
+        let ParsedMessages { columns, data_rows, rows_count } = Self::parse_messages(messages);
         if let Some(cols) = columns {
             let row_stream: Pin<Box<dyn Stream<Item = PgWireResult<DataRow>> + Send>> =
                 Box::pin(stream::iter(data_rows));
@@ -169,7 +175,7 @@ impl ProxyQueryHandler {
     }
 
     fn exec_query_stream(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> QueryResponse {
-        let (columns, data_rows, rows_count) = Self::parse_messages(messages);
+        let ParsedMessages { columns, data_rows, rows_count } = Self::parse_messages(messages);
         match columns {
             Some(cols) => {
                 let row_stream: Pin<Box<dyn Stream<Item = PgWireResult<DataRow>> + Send>> =
