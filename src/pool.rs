@@ -4,9 +4,7 @@ use deadpool_postgres::{Config, Pool};
 /// Manages backend Postgres connection pools per user.
 pub struct ConnectionManager {
     pools: std::sync::Arc<tokio::sync::RwLock<lru::LruCache<String, Pool>>>,
-    #[allow(dead_code)]
     db_url: String,
-    #[allow(dead_code)]
     max_connections: usize,
 }
 
@@ -63,10 +61,4 @@ impl ConnectionManager {
         Ok(client)
     }
 
-    /// Discard all session state before returning connection to pool.
-    #[allow(dead_code)]
-    pub async fn sanitize(client: &mut deadpool_postgres::Object) -> Result<(), ProxyError> {
-        let _ = client.simple_query("DISCARD ALL").await;
-        Ok(())
-    }
 }

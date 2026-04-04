@@ -16,7 +16,6 @@ use tokio::sync::RwLock;
 
 pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Claims {
     pub sub: String,
