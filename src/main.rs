@@ -11,15 +11,11 @@ use pgwire::api::PgWireServerHandlers;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 struct AppFactory {
     startup: Arc<StartupHandler<DefaultServerParameterProvider>>,
     query: Arc<ProxyQueryHandler>,
-    /// Stores the client_key after on_startup completes, so the outer scope
-    /// can unregister the session when this connection drops.
-    client_key: Arc<Mutex<Option<u64>>>,
 }
 
 impl AppFactory {
@@ -28,21 +24,15 @@ impl AppFactory {
         let param_provider = DefaultServerParameterProvider::default();
         let manager = Arc::new(ConnectionManager::new(database_url, pool_size));
         let registry = Arc::new(SessionRegistry::new());
-        let client_key: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let startup = Arc::new(StartupHandler::new(
             auth,
             Arc::new(param_provider),
             registry.clone(),
             manager.clone(),
-            client_key.clone(),
         ));
         let query = Arc::new(ProxyQueryHandler::new(manager, registry.clone()));
 
-        Self {
-            startup,
-            query,
-            client_key,
-        }
+        Self { startup, query }
     }
 }
 
@@ -101,9 +91,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             // After process_socket returns (client disconnected), unregister this
             // connection's backend session so the connection is returned to the pool.
-            if let Some(key) = factory.client_key.lock().await.take() {
-                factory.query.unregister(key).await;
-            }
+            factory.query.unregister_all().await;
         });
     }
 }

@@ -55,7 +55,7 @@ impl SessionRegistry {
             .insert(key, Session { conn: Some(conn) });
     }
 
-    /// Remove a session and run DISCARD ALL on the connection before returning it to the pool.
+    /// Unregister a session and run DISCARD ALL on the connection before returning it to the pool.
     #[allow(dead_code)]
     pub(crate) async fn unregister(&self, key: u64) {
         if let Some(session) = self.sessions.write().await.remove(&key) {
@@ -78,6 +78,17 @@ impl SessionRegistry {
             session.conn = Some(conn);
         }
     }
+
+    /// Unregister all sessions managed by this registry.
+    /// Drains all sessions and runs DISCARD ALL on each connection.
+    pub(crate) async fn unregister_all(&self) {
+        let sessions: Vec<_> = self.sessions.write().await.drain().collect();
+        for (_key, session) in sessions {
+            if let Some(conn) = session.conn {
+                let _ = conn.simple_query("DISCARD ALL").await;
+            }
+        }
+    }
 }
 
 impl Default for SessionRegistry {
@@ -98,8 +109,15 @@ impl ProxyQueryHandler {
 
     /// Unregister a session's backend connection and return it to the pool.
     /// Called when a client disconnects (after process_socket returns).
+    #[allow(dead_code)]
     pub async fn unregister(&self, key: u64) {
         self.registry.unregister(key).await;
+    }
+
+    /// Unregister all sessions for this handler.
+    /// Called after process_socket returns to clean up the connection's session.
+    pub async fn unregister_all(&self) {
+        self.registry.unregister_all().await;
     }
 
     fn get_user_id<C: ClientInfo>(&self, client: &C) -> PgWireResult<String> {
