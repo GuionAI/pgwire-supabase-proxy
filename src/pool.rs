@@ -1,5 +1,5 @@
 use crate::error::ProxyError;
-use deadpool_postgres::{Config, Pool};
+use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
 
 /// Manages backend Postgres connection pools per user.
 pub struct ConnectionManager {
@@ -28,6 +28,9 @@ impl ConnectionManager {
 
         let mut cfg = Config::new();
         cfg.url = Some(self.db_url.clone());
+        cfg.manager = Some(ManagerConfig {
+            recycling_method: RecyclingMethod::Clean,
+        });
         cfg.pool = Some(deadpool_postgres::PoolConfig::new(self.max_connections));
         let pool = cfg
             .create_pool(

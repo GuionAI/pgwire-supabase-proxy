@@ -38,13 +38,9 @@ impl Session {
 }
 
 impl Drop for Session {
-    #[allow(clippy::let_underscore_future)]
     fn drop(&mut self) {
-        let guard = self.inner.try_lock();
-        if let Ok(guard) = guard {
-            if let Some(conn) = guard.as_ref() {
-                let _ = conn.simple_query("DISCARD ALL");
-            }
+        if let Ok(mut mutex_guard) = self.inner.try_lock() {
+            let _conn = mutex_guard.take();
         }
     }
 }
@@ -116,7 +112,6 @@ impl ProxyQueryHandler {
                     }
                 }
                 tokio_postgres::SimpleQueryMessage::CommandComplete(_tag) => {}
-                #[allow(unreachable_patterns)]
                 _ => {}
             }
         }
@@ -181,7 +176,6 @@ impl ProxyQueryHandler {
                         break;
                     }
                 }
-                #[allow(unreachable_patterns)]
                 _ => {}
             }
         }
