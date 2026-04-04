@@ -64,8 +64,52 @@ impl ProxyQueryHandler {
             })
     }
 
-    fn exec_query(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<Response> {
-        let mut responses = Vec::new();
+    /// Acquire the session connection, run `sql`, restore the connection, return the raw messages.
+    ///
+    /// Returns `Err` only for infrastructure failures (no session, pool error).
+    /// DB-level errors are returned as `Ok(Err(...))` so callers can send them
+    /// as protocol-level error responses without tearing down the connection.
+    async fn run_query(
+        &self,
+        sql: &str,
+        fallback_user_id: Option<&str>,
+    ) -> PgWireResult<Result<Vec<tokio_postgres::SimpleQueryMessage>, tokio_postgres::Error>> {
+        let backend = { self.session.inner.lock().await.take() };
+
+        let backend = match (backend, fallback_user_id) {
+            (Some(c), _) => c,
+            (None, Some(uid)) => {
+                tracing::warn!("session has no backend connection, checking out per-query");
+                self.manager
+                    .check_out(uid)
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            }
+            (None, None) => {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "FATAL".into(),
+                    "50000".into(),
+                    "no backend connection in session".into(),
+                ))));
+            }
+        };
+
+        let messages = backend.simple_query(sql).await;
+
+        {
+            let mut guard = self.session.inner.lock().await;
+            if guard.is_none() {
+                *guard = Some(backend);
+            }
+        }
+
+        Ok(messages)
+    }
+
+    /// Parse raw `SimpleQueryMessage`s into columns + encoded rows.
+    fn parse_messages(
+        messages: Vec<tokio_postgres::SimpleQueryMessage>,
+    ) -> (Option<Arc<Vec<FieldInfo>>>, Vec<PgWireResult<DataRow>>, usize) {
         let mut columns: Option<Arc<Vec<FieldInfo>>> = None;
         let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
         let mut rows_count = 0usize;
@@ -92,7 +136,6 @@ impl ProxyQueryHandler {
                         Some(c) => c.clone(),
                         None => continue,
                     };
-
                     let mut encoder = DataRowEncoder::new(cols.clone());
                     for col in row.columns() {
                         let val: Option<&str> = row.get(col.name());
@@ -105,71 +148,28 @@ impl ProxyQueryHandler {
                     data_rows.push(Ok(encoder.take_row()));
                     rows_count += 1;
                 }
-                tokio_postgres::SimpleQueryMessage::CommandComplete(_tag) => {}
                 _ => {}
             }
         }
 
+        (columns, data_rows, rows_count)
+    }
+
+    fn exec_query(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Vec<Response> {
+        let (columns, data_rows, rows_count) = Self::parse_messages(messages);
         if let Some(cols) = columns {
             let row_stream: Pin<Box<dyn Stream<Item = PgWireResult<DataRow>> + Send>> =
                 Box::pin(stream::iter(data_rows));
             let mut qr = QueryResponse::new(cols, row_stream);
             qr.set_command_tag(&format!("SELECT {}", rows_count));
-            responses.push(Response::Query(qr));
-        } else if rows_count == 0 {
-            responses.push(Response::EmptyQuery);
+            vec![Response::Query(qr)]
+        } else {
+            vec![Response::EmptyQuery]
         }
-
-        responses
     }
 
-    fn exec_query_stream(
-        &self,
-        messages: Vec<tokio_postgres::SimpleQueryMessage>,
-    ) -> QueryResponse {
-        let mut columns: Option<Arc<Vec<FieldInfo>>> = None;
-        let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
-        let mut rows_count = 0usize;
-
-        for msg in messages {
-            match msg {
-                tokio_postgres::SimpleQueryMessage::RowDescription(cols) => {
-                    let fields: Vec<FieldInfo> = cols
-                        .iter()
-                        .map(|col| {
-                            FieldInfo::new(
-                                col.name().to_string(),
-                                None,
-                                None,
-                                Type::UNKNOWN,
-                                pgwire::api::results::FieldFormat::Text,
-                            )
-                        })
-                        .collect();
-                    columns = Some(Arc::new(fields));
-                }
-                tokio_postgres::SimpleQueryMessage::Row(row) => {
-                    let cols = match &columns {
-                        Some(c) => c.clone(),
-                        None => continue,
-                    };
-
-                    let mut encoder = DataRowEncoder::new(cols.clone());
-                    for col in row.columns() {
-                        let val: Option<&str> = row.get(col.name());
-                        if let Some(s) = val {
-                            let _ = encoder.encode_field(&s);
-                        } else {
-                            let _ = encoder.encode_field::<Option<String>>(&None);
-                        }
-                    }
-                    data_rows.push(Ok(encoder.take_row()));
-                    rows_count += 1;
-                }
-                _ => {}
-            }
-        }
-
+    fn exec_query_stream(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> QueryResponse {
+        let (columns, data_rows, rows_count) = Self::parse_messages(messages);
         match columns {
             Some(cols) => {
                 let row_stream: Pin<Box<dyn Stream<Item = PgWireResult<DataRow>> + Send>> =
@@ -187,7 +187,7 @@ impl ProxyQueryHandler {
         }
     }
 
-    fn exec_command_tag(&self, messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Tag {
+    fn exec_command_tag(messages: Vec<tokio_postgres::SimpleQueryMessage>) -> Tag {
         let mut rows_affected = 0u64;
         for msg in messages {
             if let tokio_postgres::SimpleQueryMessage::CommandComplete(count) = msg {
@@ -213,30 +213,7 @@ impl pgwire::api::query::SimpleQueryHandler for ProxyQueryHandler {
         let user_id = self.get_user_id(client)?;
         tracing::debug!(user_id = %user_id, query = %query, "do_query");
 
-        let backend = {
-            let mut guard = self.session.inner.lock().await;
-            guard.take()
-        };
-
-        let backend = match backend {
-            Some(c) => c,
-            None => {
-                tracing::warn!("session has no backend connection, checking out per-query");
-                self.manager
-                    .check_out(&user_id)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
-            }
-        };
-
-        let messages = backend.simple_query(query).await;
-
-        {
-            let mut guard = self.session.inner.lock().await;
-            if guard.is_none() {
-                *guard = Some(backend);
-            }
-        }
+        let messages = self.run_query(query, Some(&user_id)).await?;
 
         match messages {
             Ok(msgs) => {
@@ -244,7 +221,7 @@ impl pgwire::api::query::SimpleQueryHandler for ProxyQueryHandler {
                 let mut responses = if is_select_query(&upper) {
                     Self::exec_query(msgs)
                 } else {
-                    vec![Response::Execution(self.exec_command_tag(msgs))]
+                    vec![Response::Execution(Self::exec_command_tag(msgs))]
                 };
 
                 if upper == "BEGIN" || upper.starts_with("BEGIN ") {
@@ -294,37 +271,14 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
         let q = substitute_params(&query, &portal.parameters);
         let upper = query.trim().to_uppercase();
 
-        let backend = {
-            let mut guard = self.session.inner.lock().await;
-            guard.take()
-        };
-
-        let backend = match backend {
-            Some(c) => c,
-            None => {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "FATAL".into(),
-                    "50000".into(),
-                    "no backend connection in session".into(),
-                ))));
-            }
-        };
-
-        let messages = backend.simple_query(&q).await;
-
-        {
-            let mut guard = self.session.inner.lock().await;
-            if guard.is_none() {
-                *guard = Some(backend);
-            }
-        }
+        let messages = self.run_query(&q, None).await?;
 
         match messages {
             Ok(msgs) => {
                 if is_select_query(&upper) {
-                    Ok(Response::Query(self.exec_query_stream(msgs)))
+                    Ok(Response::Query(Self::exec_query_stream(msgs)))
                 } else {
-                    Ok(Response::Execution(self.exec_command_tag(msgs)))
+                    Ok(Response::Execution(Self::exec_command_tag(msgs)))
                 }
             }
             Err(e) => {
@@ -422,7 +376,7 @@ fn substitute_params(sql: &str, params: &[Option<Bytes>]) -> String {
 }
 
 /// Escape a string value for use in a PostgreSQL literal.
-fn escape_pg_string(s: &str) -> String {
+pub(crate) fn escape_pg_string(s: &str) -> String {
     let mut r = String::with_capacity(s.len() * 2);
     for c in s.chars() {
         match c {

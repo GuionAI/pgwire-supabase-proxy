@@ -11,7 +11,6 @@ use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
 
@@ -29,24 +28,21 @@ pub struct Claims {
 }
 
 pub struct JwtAuthenticator {
-    jwt_secret: Arc<RwLock<String>>,
+    jwt_secret: String,
 }
 
 impl JwtAuthenticator {
     pub fn new(jwt_secret: String) -> Self {
-        Self {
-            jwt_secret: Arc::new(RwLock::new(jwt_secret)),
-        }
+        Self { jwt_secret }
     }
 
     pub async fn validate_token(&self, token: &str) -> Result<Claims, ProxyError> {
-        let secret = self.jwt_secret.read().await;
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
 
         decode::<Claims>(
             token,
-            &DecodingKey::from_secret(secret.as_bytes()),
+            &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
             &validation,
         )
         .map_err(|e| {

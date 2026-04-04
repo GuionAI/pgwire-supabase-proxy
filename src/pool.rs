@@ -1,9 +1,11 @@
 use crate::error::ProxyError;
+use crate::handler::escape_pg_string;
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod};
+use tokio::sync::Mutex;
 
 /// Manages backend Postgres connection pools per user.
 pub struct ConnectionManager {
-    pools: std::sync::Arc<tokio::sync::RwLock<lru::LruCache<String, Pool>>>,
+    pools: std::sync::Arc<Mutex<lru::LruCache<String, Pool>>>,
     db_url: String,
     max_connections: usize,
 }
@@ -11,7 +13,7 @@ pub struct ConnectionManager {
 impl ConnectionManager {
     pub fn new(database_url: String, max_connections: usize) -> Self {
         Self {
-            pools: std::sync::Arc::new(tokio::sync::RwLock::new(lru::LruCache::new(
+            pools: std::sync::Arc::new(Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(1024).unwrap(),
             ))),
             db_url: database_url,
@@ -21,7 +23,7 @@ impl ConnectionManager {
 
     /// Get or create a pool for the given user_id.
     pub async fn get_pool(&self, user_id: &str) -> Result<Pool, ProxyError> {
-        let mut pools = self.pools.write().await;
+        let mut pools = self.pools.lock().await;
         if let Some(pool) = pools.get(user_id) {
             return Ok(pool.clone());
         }
@@ -62,12 +64,12 @@ impl ConnectionManager {
         tracing::debug!(user_id = %user_id, "RLS context set");
         Ok(client)
     }
-
 }
 
 /// Escape a user_id for safe interpolation into a SET statement literal.
+/// Delegates to `escape_pg_string` to keep a single escaping SSOT.
 pub(crate) fn escape_user_id(user_id: &str) -> String {
-    user_id.replace('\'', "''")
+    escape_pg_string(user_id)
 }
 
 #[cfg(test)]
