@@ -8,7 +8,7 @@ PostgREST validates a JWT, sets `SET ROLE authenticated` and `SET request.jwt.cl
 
 ```
 pgwire client (tw CLI)
-  │ JWT as "user" field in startup
+  │ StartupMessage → CleartextPassword challenge → JWT as password
   ▼
 pgwire-supabase-proxy
   │ Validates JWT using SUPABASE_JWT_SECRET
@@ -23,13 +23,15 @@ The `auth.uid()` function in Postgres reads `current_setting('request.jwt.claim.
 
 ## Auth flow
 
-1. Client sends pgwire `StartupMessage` with JWT as the `user` field (no password)
-2. Proxy validates the JWT, extracts the `sub` claim
-3. Proxy acquires a backend connection from the per-user pool
-4. Proxy runs `SET ROLE authenticated` and `SET request.jwt.claim.sub = '$user_id'`
-5. Proxy returns `AuthenticationOk` and holds the connection for the session
-6. All subsequent queries are forwarded over the same backend connection
-7. On session end: `DISCARD ALL` and return connection to pool
+1. Client sends pgwire `StartupMessage` with any `user` value
+2. Proxy responds with `AuthenticationCleartextPassword` challenge
+3. Client sends JWT as the password in `PasswordMessage`
+4. Proxy validates the JWT, extracts the `sub` claim
+5. Proxy acquires a backend connection from the per-user pool
+6. Proxy runs `SET ROLE authenticated` and `SET request.jwt.claim.sub = '$user_id'`
+7. Proxy returns `AuthenticationOk` and holds the connection for the session
+8. All subsequent queries are forwarded over the same backend connection
+9. On session end: connection returned to pool; `DISCARD ALL` runs on next checkout
 
 ## SQL parameter substitution (Extended Query Protocol)
 

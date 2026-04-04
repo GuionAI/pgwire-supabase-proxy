@@ -2,13 +2,12 @@ use crate::error::ProxyError;
 use crate::handler::Session;
 use crate::pool::ConnectionManager;
 use async_trait::async_trait;
-use futures::SinkExt;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use pgwire::api::auth::ServerParameterProvider;
+use futures::SinkExt;
+use pgwire::api::auth::{finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider};
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
-use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
+use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -67,7 +66,7 @@ pub struct StartupHandler<S: ServerParameterProvider> {
     manager: Arc<ConnectionManager>,
     /// Set once in `on_startup` after JWT auth. Shared (via Arc) with `ProxyQueryHandler`
     /// so both handlers access the same backend connection. Dropped when the socket closes,
-    /// which triggers `Session::drop` → `DISCARD ALL`.
+    /// which triggers `Session::drop` → connection returned to pool.
     session: Arc<Session>,
 }
 
@@ -113,76 +112,52 @@ where
         C::Error: std::fmt::Debug,
         PgWireError: From<C::Error>,
     {
-        let PgWireFrontendMessage::Startup(startup) = message else {
-            return Ok(());
-        };
-
-        let token = startup.parameters.get("user").ok_or_else(|| {
-            PgWireError::ApiError(Box::new(ProxyError::InvalidStartup("missing user".into())))
-        })?;
-
-        tracing::info!(
-            user_prefix = %token.chars().take(20).collect::<String>(),
-            "connection attempt"
-        );
-
-        let claims = self.auth.validate_token(token).await.map_err(|e| {
-            tracing::warn!(error = %e, "authentication failed");
-            PgWireError::ApiError(Box::new(e))
-        })?;
-
-        tracing::info!(user_id = %claims.sub, "authenticated");
-
-        match self.manager.check_out(&claims.sub).await {
-            Ok(c) => {
-                self.session.inner.lock().await.replace(c);
-                tracing::debug!(user_id = %claims.sub, "backend connection acquired");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");
-                return Err(PgWireError::ApiError(Box::new(e)));
-            }
-        }
-
-        client
-            .metadata_mut()
-            .insert(METADATA_USER_ID.to_string(), claims.sub.clone());
-        for (k, v) in &startup.parameters {
-            client.metadata_mut().insert(k.clone(), v.clone());
-        }
-
-        client
-            .send(PgWireBackendMessage::Authentication(Authentication::Ok))
-            .await
-            .map_err(PgWireError::from)?;
-
-        if let Some(params) = self.param_provider.server_parameters(client) {
-            for (k, v) in params {
+        match message {
+            PgWireFrontendMessage::Startup(ref startup) => {
+                save_startup_parameters_to_metadata(client, startup);
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
                 client
-                    .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
-                        k, v,
-                    )))
+                    .feed(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
                     .await
                     .map_err(PgWireError::from)?;
+                client.flush().await.map_err(PgWireError::from)?;
             }
+            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
+                let token = pwd.into_password()?.password;
+
+                tracing::info!(
+                    user_prefix = %token.chars().take(20).collect::<String>(),
+                    "connection attempt"
+                );
+
+                let claims = self.auth.validate_token(&token).await.map_err(|e| {
+                    tracing::warn!(error = %e, "authentication failed");
+                    PgWireError::ApiError(Box::new(e))
+                })?;
+
+                tracing::info!(user_id = %claims.sub, "authenticated");
+
+                match self.manager.check_out(&claims.sub).await {
+                    Ok(c) => {
+                        self.session.inner.lock().await.replace(c);
+                        tracing::debug!(user_id = %claims.sub, "backend connection acquired");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");
+                        return Err(PgWireError::ApiError(Box::new(e)));
+                    }
+                }
+
+                client
+                    .metadata_mut()
+                    .insert(METADATA_USER_ID.to_string(), claims.sub.clone());
+
+                finish_authentication(client, self.param_provider.as_ref()).await?;
+            }
+            _ => {}
         }
-
-        client
-            .send(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
-                0,
-                SecretKey::I32(0),
-            )))
-            .await
-            .map_err(PgWireError::from)?;
-
-        client
-            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
-                TransactionStatus::Idle,
-            )))
-            .await
-            .map_err(PgWireError::from)?;
-        client.set_state(PgWireConnectionState::ReadyForQuery);
-
         Ok(())
     }
 }
