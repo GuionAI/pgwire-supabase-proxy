@@ -6,8 +6,11 @@ use bytes::Bytes;
 use futures::{stream, Sink, Stream};
 use pgwire::api::portal::Portal;
 use pgwire::api::query::ExtendedQueryHandler;
-use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::stmt::QueryParser;
+use pgwire::api::results::{
+    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldInfo, FieldFormat,
+    QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
@@ -110,6 +113,44 @@ impl ProxyQueryHandler {
         }
 
         Ok(messages)
+    }
+
+    /// Execute `f` with a backend connection borrowed from the session (or checked out
+    /// per-query), then restore the connection before returning.
+    async fn with_backend<C>(
+        &self,
+        client: &C,
+        fallback_user_id: Option<&str>,
+        sql: &str,
+    ) -> PgWireResult<tokio_postgres::Statement>
+    where
+        C: ClientInfo,
+    {
+        let user_id = self.get_user_id(client)?;
+        let backend = { self.session.inner.lock().await.take() };
+
+        let backend = match backend {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    "session has no backend connection, checking out per-query"
+                );
+                self.manager
+                    .check_out(fallback_user_id.unwrap_or(&user_id))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            }
+        };
+
+        let result = backend.prepare(sql).await;
+        {
+            let mut guard = self.session.inner.lock().await;
+            if guard.is_none() {
+                *guard = Some(backend);
+            }
+        }
+
+        result.map_err(|e| PgWireError::ApiError(Box::new(e)))
     }
 
     /// Parse raw `SimpleQueryMessage`s into columns + encoded rows.
@@ -296,6 +337,66 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
                 ))))
             }
         }
+    }
+
+    /// Override required because `StringQueryParser::get_parameter_types` and
+    /// `StringQueryParser::get_result_schema` both return empty vecs.
+    /// The default implementations of `do_describe_statement` / `do_describe_portal`
+    /// would therefore tell clients there are 0 parameters and 0 result columns,
+    /// causing "expected 0 parameters but got N" errors and column index panics.
+    /// By forwarding the describe to the Postgres backend we get the real
+    /// parameter/column metadata from the prepared statement.
+    async fn do_describe_statement<C>(
+        &self,
+        client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let sql = target.statement.clone();
+        let stmt = self.with_backend(client, None, &sql).await?;
+
+        let param_types: Vec<pgwire::api::Type> = stmt.params().to_vec();
+        let fields: Vec<FieldInfo> = stmt
+            .columns()
+            .iter()
+            .map(|col| {
+                FieldInfo::new(
+                    col.name().to_string(),
+                    None,
+                    None,
+                    col.type_().clone(),
+                    FieldFormat::Text,
+                )
+            })
+            .collect();
+
+        Ok(DescribeStatementResponse::new(param_types, fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let sql = portal.statement.statement.clone();
+        let stmt = self.with_backend(client, None, &sql).await?;
+
+        let fields: Vec<FieldInfo> = stmt
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(idx, col)| {
+                let fmt = portal.result_column_format.format_for(idx);
+                FieldInfo::new(col.name().to_string(), None, None, col.type_().clone(), fmt)
+            })
+            .collect();
+
+        Ok(DescribePortalResponse::new(fields))
     }
 }
 
