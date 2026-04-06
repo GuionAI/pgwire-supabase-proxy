@@ -10,8 +10,7 @@ use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldInfo, FieldFormat,
     QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::StoredStatement;
-use pgwire::api::stmt::QueryParser;
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
@@ -114,6 +113,44 @@ impl ProxyQueryHandler {
         }
 
         Ok(messages)
+    }
+
+    /// Execute `f` with a backend connection borrowed from the session (or checked out
+    /// per-query), then restore the connection before returning.
+    async fn with_backend<C>(
+        &self,
+        client: &C,
+        fallback_user_id: Option<&str>,
+        sql: &str,
+    ) -> PgWireResult<tokio_postgres::Statement>
+    where
+        C: ClientInfo,
+    {
+        let user_id = self.get_user_id(client)?;
+        let backend = { self.session.inner.lock().await.take() };
+
+        let backend = match backend {
+            Some(c) => c,
+            None => {
+                tracing::warn!(
+                    "session has no backend connection, checking out per-query"
+                );
+                self.manager
+                    .check_out(fallback_user_id.unwrap_or(&user_id))
+                    .await
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            }
+        };
+
+        let result = backend.prepare(sql).await;
+        {
+            let mut guard = self.session.inner.lock().await;
+            if guard.is_none() {
+                *guard = Some(backend);
+            }
+        }
+
+        result.map_err(|e| PgWireError::ApiError(Box::new(e)))
     }
 
     /// Parse raw `SimpleQueryMessage`s into columns + encoded rows.
@@ -311,36 +348,14 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
     /// parameter/column metadata from the prepared statement.
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let user_id = self.get_user_id(_client)?;
-        let backend = { self.session.inner.lock().await.take() };
-
-        let backend = match backend {
-            Some(c) => c,
-            None => {
-                tracing::warn!(
-                    "session has no backend connection in do_describe_statement, checking out per-query"
-                );
-                self.manager
-                    .check_out(&user_id)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
-            }
-        };
-
-        let result = backend.prepare(&target.statement).await;
-        {
-            let mut guard = self.session.inner.lock().await;
-            if guard.is_none() {
-                *guard = Some(backend);
-            }
-        }
-        let stmt = result.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let sql = target.statement.clone();
+        let stmt = self.with_backend(client, None, &sql).await?;
 
         let param_types: Vec<pgwire::api::Type> = stmt.params().to_vec();
         let fields: Vec<FieldInfo> = stmt
@@ -362,36 +377,14 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let user_id = self.get_user_id(_client)?;
-        let backend = { self.session.inner.lock().await.take() };
-
-        let backend = match backend {
-            Some(c) => c,
-            None => {
-                tracing::warn!(
-                    "session has no backend connection in do_describe_portal, checking out per-query"
-                );
-                self.manager
-                    .check_out(&user_id)
-                    .await
-                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
-            }
-        };
-
-        let result = backend.prepare(&portal.statement.statement).await;
-        {
-            let mut guard = self.session.inner.lock().await;
-            if guard.is_none() {
-                *guard = Some(backend);
-            }
-        }
-        let stmt = result.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        let sql = portal.statement.statement.clone();
+        let stmt = self.with_backend(client, None, &sql).await?;
 
         let fields: Vec<FieldInfo> = stmt
             .columns()
@@ -399,13 +392,7 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
             .enumerate()
             .map(|(idx, col)| {
                 let fmt = portal.result_column_format.format_for(idx);
-                FieldInfo::new(
-                    col.name().to_string(),
-                    None,
-                    None,
-                    col.type_().clone(),
-                    fmt,
-                )
+                FieldInfo::new(col.name().to_string(), None, None, col.type_().clone(), fmt)
             })
             .collect();
 
