@@ -30,39 +30,6 @@ const BACKEND_PASSWORD: &str = "dev-password";
 const BACKEND_DB: &str = "supabase";
 
 /// One-time setup: patch auth.uid() once before any test runs.
-/// Runs in a blocking thread to avoid conflicts with the test Tokio runtime.
-static SETUP_DONE: std::sync::Once = std::sync::Once::new();
-
-fn ensure_setup() {
-    SETUP_DONE.call_once(|| {
-        let url = format!(
-            "host={} port={} user={} password={} dbname={}",
-            BACKEND_HOST, BACKEND_PORT, BACKEND_USER, BACKEND_PASSWORD, BACKEND_DB
-        );
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let (client, connection) =
-                tokio_postgres::connect(&url, tokio_postgres::NoTls)
-                    .await
-                    .expect("failed to connect to postgres for auth.uid patch");
-
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("setup postgres connection error: {}", e);
-                }
-            });
-
-            client
-                .batch_execute(
-                    "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
-                     SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
-                )
-                .await
-                .expect("failed to patch auth.uid()");
-        });
-    });
-}
-
 /// Test JWT secret — must match what psp is configured with.
 const TEST_JWT_SECRET: &str = "test-jwt-secret-for-integration-testing-only";
 /// A fixed user_id to use for all test operations.
@@ -152,10 +119,35 @@ fn psp_database_url() -> String {
     )
 }
 
+/// Serial setup test — must run before any parallel test.
+/// Uses #[serial] (via crate feature) to ensure it runs first.
+/// Patches auth.uid() so RLS works for all subsequent tests.
+#[tokio::test]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
+async fn integration_setup() {
+    let url = psp_database_url();
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("failed to connect to postgres for auth.uid patch");
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("setup postgres connection error: {}", e);
+        }
+    });
+
+    client
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
+             SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
+        )
+        .await
+        .expect("failed to patch auth.uid()");
+}
+
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
@@ -173,7 +165,6 @@ async fn integration_note_list() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list_json() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
@@ -191,7 +182,6 @@ async fn integration_note_list_json() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_count() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
@@ -209,7 +199,6 @@ async fn integration_note_count() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_find() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
@@ -222,7 +211,6 @@ async fn integration_note_find() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_project_list() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
@@ -235,7 +223,6 @@ async fn integration_note_project_list() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_add() {
-    ensure_setup();
     let psp_db_url = psp_database_url();
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
