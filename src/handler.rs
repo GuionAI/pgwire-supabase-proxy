@@ -46,6 +46,12 @@ impl Session {
     }
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut mutex_guard) = self.inner.try_lock() {
