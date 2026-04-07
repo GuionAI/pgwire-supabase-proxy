@@ -3,20 +3,51 @@ name = "pgwire-supabase-proxy"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "pgwire_supabase_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pgwire-supabase-proxy"
+path = "src/main.rs"
+
 [dependencies]
-pgwire = { version = "0.38", features = ["server-api-aws-lc-rs"] }
-tokio-postgres = "0.7"
-deadpool-postgres = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
-async-trait = "0.1"
-futures = "0.3"
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "signal", "io-util"] }
+
+# Wire protocol
 bytes = "1"
+
+# Auth
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
 thiserror = "2"
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-lru = "0.16"
+
+# SCRAM
+hmac = "0.12"
+sha2 = "0.10"
+
+# Base64 (SCRAM)
+base64 = "0.22"
+
+# Random
+rand = "0.8"
+
+# TLS (optional — enable with features = ["tls"]; currently disabled for no-TLS MVP)
+# tokio-rustls = "0.26"
+# rustls = "0.23"
+# webpki-roots = "0.26"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "fs"] }
+tokio-postgres = "0.7"

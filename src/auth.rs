@@ -1,19 +1,9 @@
-use crate::error::ProxyError;
-use crate::handler::Session;
-use crate::pool::ConnectionManager;
-use async_trait::async_trait;
+//! JWT authentication utilities.
+
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use futures::SinkExt;
-use pgwire::api::auth::{finish_authentication, save_startup_parameters_to_metadata, ServerParameterProvider};
-use pgwire::api::{ClientInfo, PgWireConnectionState};
-use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::startup::Authentication;
-use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-pub const METADATA_USER_ID: &str = "pgwire_supabase_proxy.user_id";
-
+/// JWT claims extracted from the `sub` field.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Claims {
     pub sub: String,
@@ -27,6 +17,8 @@ pub struct Claims {
     pub email: Option<String>,
 }
 
+/// Validates HS256 JWTs.
+#[derive(Clone)]
 pub struct JwtAuthenticator {
     jwt_secret: String,
 }
@@ -36,7 +28,8 @@ impl JwtAuthenticator {
         Self { jwt_secret }
     }
 
-    pub async fn validate_token(&self, token: &str) -> Result<Claims, ProxyError> {
+    /// Decode and verify a JWT. Returns the claims on success.
+    pub async fn validate_token(&self, token: &str) -> Result<Claims, crate::ProxyError> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
 
@@ -48,113 +41,11 @@ impl JwtAuthenticator {
         .map_err(|e| {
             tracing::debug!(error = %e, "JWT validation failed");
             match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => ProxyError::JwtExpired,
-                _ => ProxyError::InvalidJwt(e.to_string()),
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => crate::ProxyError::JwtExpired,
+                _ => crate::ProxyError::InvalidJwt(e.to_string()),
             }
         })
         .map(|td| td.claims)
-    }
-}
-
-pub struct StartupHandler<S: ServerParameterProvider> {
-    auth: Arc<JwtAuthenticator>,
-    param_provider: Arc<S>,
-    manager: Arc<ConnectionManager>,
-    /// Set once in `on_startup` after JWT auth. Shared (via Arc) with `ProxyQueryHandler`
-    /// so both handlers access the same backend connection. Dropped when the socket closes,
-    /// which triggers `Session::drop` → connection returned to pool.
-    session: Arc<Session>,
-}
-
-impl<S: ServerParameterProvider> StartupHandler<S> {
-    pub fn new(
-        auth: Arc<JwtAuthenticator>,
-        param_provider: Arc<S>,
-        manager: Arc<ConnectionManager>,
-        session: Arc<Session>,
-    ) -> Self {
-        Self {
-            auth,
-            param_provider,
-            manager,
-            session,
-        }
-    }
-}
-
-impl<S: ServerParameterProvider + Clone + Send + Sync + 'static> Clone for StartupHandler<S> {
-    fn clone(&self) -> Self {
-        Self {
-            auth: self.auth.clone(),
-            param_provider: self.param_provider.clone(),
-            manager: self.manager.clone(),
-            session: self.session.clone(),
-        }
-    }
-}
-
-#[async_trait]
-impl<S> pgwire::api::auth::StartupHandler for StartupHandler<S>
-where
-    S: ServerParameterProvider + 'static,
-{
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
-    where
-        C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: std::fmt::Debug,
-        PgWireError: From<C::Error>,
-    {
-        match message {
-            PgWireFrontendMessage::Startup(ref startup) => {
-                save_startup_parameters_to_metadata(client, startup);
-                client.set_state(PgWireConnectionState::AuthenticationInProgress);
-                client
-                    .feed(PgWireBackendMessage::Authentication(
-                        Authentication::CleartextPassword,
-                    ))
-                    .await
-                    .map_err(PgWireError::from)?;
-                client.flush().await.map_err(PgWireError::from)?;
-            }
-            PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
-                let token = pwd.into_password()?.password;
-
-                tracing::info!(
-                    user_prefix = %token.chars().take(20).collect::<String>(),
-                    "connection attempt"
-                );
-
-                let claims = self.auth.validate_token(&token).await.map_err(|e| {
-                    tracing::warn!(error = %e, "authentication failed");
-                    PgWireError::ApiError(Box::new(e))
-                })?;
-
-                tracing::info!(user_id = %claims.sub, "authenticated");
-
-                match self.manager.check_out(&claims.sub).await {
-                    Ok(c) => {
-                        self.session.inner.lock().await.replace(c);
-                        tracing::debug!(user_id = %claims.sub, "backend connection acquired");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, user_id = %claims.sub, "failed to acquire backend connection");
-                        return Err(PgWireError::ApiError(Box::new(e)));
-                    }
-                }
-
-                client
-                    .metadata_mut()
-                    .insert(METADATA_USER_ID.to_string(), claims.sub.clone());
-
-                finish_authentication(client, self.param_provider.as_ref()).await?;
-            }
-            _ => {}
-        }
-        Ok(())
     }
 }
 
@@ -194,19 +85,12 @@ mod tests {
     #[tokio::test]
     async fn test_valid_jwt() {
         let secret = "test-secret-32-chars-minimum!";
-        let token = make_test_token(secret, "user-123", 3600);
+        let token = make_test_token(secret, "550e8400-e29b-41d4-a716-446655440000", 3600);
 
         let auth = JwtAuthenticator::new(secret.to_string());
         let result = auth.validate_token(&token).await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().sub, "user-123");
-    }
-
-    #[tokio::test]
-    async fn test_invalid_jwt() {
-        let auth = JwtAuthenticator::new("test-secret".to_string());
-        let result = auth.validate_token("invalid.token.here").await;
-        assert!(matches!(result, Err(ProxyError::InvalidJwt(_))));
+        assert_eq!(result.unwrap().sub, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[tokio::test]
@@ -216,7 +100,14 @@ mod tests {
 
         let auth = JwtAuthenticator::new(secret.to_string());
         let result = auth.validate_token(&token).await;
-        assert!(matches!(result, Err(ProxyError::JwtExpired)));
+        assert!(matches!(result, Err(crate::ProxyError::JwtExpired)));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_jwt() {
+        let auth = JwtAuthenticator::new("test-secret".to_string());
+        let result = auth.validate_token("invalid.token.here").await;
+        assert!(matches!(result, Err(crate::ProxyError::InvalidJwt(_))));
     }
 
     #[tokio::test]
@@ -224,6 +115,6 @@ mod tests {
         let token = make_test_token("correct-secret-32-chars-minimum", "user-123", 3600);
         let auth = JwtAuthenticator::new("wrong-secret-32-chars-minimum!!".to_string());
         let result = auth.validate_token(&token).await;
-        assert!(matches!(result, Err(ProxyError::InvalidJwt(_))));
+        assert!(matches!(result, Err(crate::ProxyError::InvalidJwt(_))));
     }
 }
