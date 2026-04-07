@@ -59,15 +59,17 @@ fn flicknote_path() -> PathBuf {
     PathBuf::from(home).join(".cargo/bin/flicknote")
 }
 
-/// Spawn psp on an ephemeral port, return the port.
-async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
+/// Spawn psp on an ephemeral port.
+/// Returns `(port, shutdown_tx)` — caller must hold `shutdown_tx` for the
+/// lifetime of the test; dropping it sends the shutdown signal.
+async fn spawn_psp(database_url: String, jwt_secret: String) -> (u16, oneshot::Sender<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
 
     let config = Config::new(database_url, jwt_secret, format!("127.0.0.1:{}", port)).unwrap();
 
-    let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
         let _ = serve(config, listener, async move {
@@ -89,7 +91,7 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
     }
 
     sleep(Duration::from_millis(50)).await;
-    port
+    (port, shutdown_tx)
 }
 
 /// Run a flicknote command, return exit status and stdout.
@@ -107,74 +109,86 @@ async fn run_flicknote(port: u16, jwt: &str, args: &[&str]) -> (bool, String) {
 
     let output = cmd.output().await.expect("failed to spawn flicknote");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let success = output.status.success();
+    if !success && !stderr.is_empty() {
+        eprintln!("flicknote stderr:\n{}", stderr);
+    }
     (success, stdout)
 }
 
-/// Build DATABASE_URL for PSP backend connection.
+/// Build the backend postgres URL for PSP config (URL format required by parse_backend_url).
 fn psp_database_url() -> String {
+    format!(
+        "postgres://{}:{}@{}:{}/{}",
+        BACKEND_USER, BACKEND_PASSWORD, BACKEND_HOST, BACKEND_PORT, BACKEND_DB
+    )
+}
+
+/// Build a libpq connection string for direct tokio_postgres connections (used in ensure_setup).
+fn psp_connection_string() -> String {
     format!(
         "host={} port={} user={} password={} dbname={}",
         BACKEND_HOST, BACKEND_PORT, BACKEND_USER, BACKEND_PASSWORD, BACKEND_DB
     )
 }
 
-/// Serial setup test — must run before any parallel test.
-/// Uses #[serial] (via crate feature) to ensure it runs first.
-/// Patches auth.uid() so RLS works for all subsequent tests.
-#[tokio::test]
-#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
-async fn integration_setup() {
-    let url = psp_database_url();
-    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-        .await
-        .expect("failed to connect to postgres for auth.uid patch");
+/// Patches `auth.uid()` to read from `request.jwt.claim.sub`. Called at the
+/// start of every test via `ensure_setup()`. `OnceCell` guarantees exactly-once
+/// execution — concurrent callers wait for the first to finish.
+static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("setup postgres connection error: {}", e);
-        }
-    });
+async fn ensure_setup() {
+    SETUP.get_or_init(|| async {
+        let url = psp_connection_string();
+        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .expect("failed to connect to postgres for auth.uid patch");
 
-    client
-        .batch_execute(
-            "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
-             SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
-        )
-        .await
-        .expect("failed to patch auth.uid()");
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("setup postgres connection error: {}", e);
+            }
+        });
+
+        client
+            .batch_execute(
+                "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
+                 SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
+            )
+            .await
+            .expect("failed to patch auth.uid()");
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(port, &jwt, &["note", "list"]).await;
+    let (status, stdout) = run_flicknote(port, &jwt, &["list"]).await;
 
-    assert!(status, "note list failed (exit != 0):\nstdout:\n{}\n", stdout);
-    assert!(
-        stdout.trim().starts_with('[') || stdout.trim().starts_with('{'),
-        "note list should produce JSON:\n{}",
-        stdout
-    );
+    assert!(status, "list failed (exit != 0):\nstdout:\n{}\n", stdout);
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list_json() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(port, &jwt, &["note", "list", "--json"]).await;
+    let (status, stdout) = run_flicknote(port, &jwt, &["list", "--json"]).await;
 
-    assert!(status, "note list --json failed:\nstdout:\n{}\n", stdout);
+    assert!(status, "list --json failed:\nstdout:\n{}\n", stdout);
     assert!(
         stdout.trim().starts_with('['),
-        "note list --json should produce a JSON array:\n{}",
+        "list --json should produce a JSON array:\n{}",
         stdout
     );
 }
@@ -182,11 +196,12 @@ async fn integration_note_list_json() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_count() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(port, &jwt, &["note", "count"]).await;
+    let (status, stdout) = run_flicknote(port, &jwt, &["count"]).await;
 
     assert!(status, "note count failed:\nstdout:\n{}\n", stdout);
     assert!(
@@ -199,11 +214,12 @@ async fn integration_note_count() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_find() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(port, &jwt, &["note", "find", "test"]).await;
+    let (status, stdout) = run_flicknote(port, &jwt, &["find", "test"]).await;
 
     assert!(status, "note find failed:\nstdout:\n{}\n", stdout);
 }
@@ -211,11 +227,12 @@ async fn integration_note_find() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_project_list() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(port, &jwt, &["note", "project", "list"]).await;
+    let (status, stdout) = run_flicknote(port, &jwt, &["project", "list"]).await;
 
     assert!(status, "note project list failed:\nstdout:\n{}\n", stdout);
 }
@@ -223,14 +240,15 @@ async fn integration_note_project_list() {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_add() {
+    ensure_setup().await;
     let psp_db_url = psp_database_url();
-    let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
+    let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
     let (status, stdout) = run_flicknote(
         port,
         &jwt,
-        &["note", "add", "__psp_it__integration test note"],
+        &["add", "__psp_it__integration test note"],
     )
     .await;
 

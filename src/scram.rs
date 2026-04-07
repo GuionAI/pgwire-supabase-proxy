@@ -33,11 +33,10 @@ where
             .collect()
     }; // rng dropped here, before first .await
 
-    // Step 1: ClientFirst
+    // Step 1: ClientFirst — GS2 header is "n,," (no channel binding)
     let client_first_bare = format!("n={},r={}", username, client_nonce);
-    let client_first = format!("{},,{}", SHA256_NAME, client_first_bare);
+    let client_first = format!("n,,{}", client_first_bare);
     send_sasl_initial_response(stream, SHA256_NAME, client_first.as_bytes()).await?;
-    send_sasl_response(stream, client_first.as_bytes()).await?;
 
     // Step 2: ServerFirst
     let server_first_raw = read_sasl_continue(stream).await?;
@@ -79,8 +78,8 @@ where
 
     send_sasl_response(stream, full_client_final.as_bytes()).await?;
 
-    // Step 4: ServerSignature
-    let server_final_raw = read_sasl_continue(stream).await?;
+    // Step 4: ServerSignature — server sends AuthenticationSASLFinal (type 12)
+    let server_final_raw = read_sasl_final(stream).await?;
     let server_final_str = std::str::from_utf8(&server_final_raw)
         .map_err(|_| ProxyError::BackendAuth("invalid UTF-8 in server-final".into()))?;
 
@@ -223,6 +222,7 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Result<Vec<u8>, ProxyErr
     mac.update(salt);
     mac.update(&1u32.to_be_bytes());
     u.copy_from_slice(&mac.finalize().into_bytes());
+    result.copy_from_slice(&u); // XOR in U1 (result is zeroed, so copy = XOR)
 
     for _ in 2..=iterations {
         let mut mac = HmacSha256::new_from_slice(password).map_err(|e| ProxyError::BackendAuth(e.to_string()))?;
@@ -351,7 +351,8 @@ where
 {
     let mut buf = Vec::new();
     buf.push(b'p');
-    let response_len = 4 + mechanism.len() + 1 + initial_response.len();
+    // length = 4 (self) + mechanism + null + Int32(initial_response_len) + initial_response
+    let response_len = 4 + mechanism.len() + 1 + 4 + initial_response.len();
     buf.extend_from_slice(&(response_len as u32).to_be_bytes());
     buf.extend_from_slice(mechanism.as_bytes());
     buf.push(0);
@@ -380,7 +381,7 @@ where
     Ok(())
 }
 
-async fn read_sasl_continue<S>(stream: &mut S) -> Result<Vec<u8>, ProxyError>
+async fn read_sasl_auth_message<S>(stream: &mut S, expected_type: u32) -> Result<Vec<u8>, ProxyError>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -388,27 +389,39 @@ where
     stream.read_exact(&mut type_buf).await?;
     if type_buf[0] != b'R' {
         return Err(ProxyError::ProtocolViolation(format!(
-            "expected SASLContinue (R), got {:02x}",
+            "expected SASL auth message (R), got {:02x}",
             type_buf[0]
         )));
     }
-
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
-
     let mut body = vec![0u8; (len - 4) as usize];
     stream.read_exact(&mut body).await?;
-
     let auth_type = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-    if auth_type != 11 {
+    if auth_type != expected_type {
         return Err(ProxyError::ProtocolViolation(format!(
-            "expected SASLContinue (11), got {}",
-            auth_type
+            "expected SASL auth type {}, got {}",
+            expected_type, auth_type
         )));
     }
-
     Ok(body[4..].to_vec())
+}
+
+/// Read AuthenticationSASLContinue (type 11) from the backend.
+async fn read_sasl_continue<S>(stream: &mut S) -> Result<Vec<u8>, ProxyError>
+where
+    S: AsyncReadExt + Unpin,
+{
+    read_sasl_auth_message(stream, 11).await
+}
+
+/// Read AuthenticationSASLFinal (type 12) from the backend.
+async fn read_sasl_final<S>(stream: &mut S) -> Result<Vec<u8>, ProxyError>
+where
+    S: AsyncReadExt + Unpin,
+{
+    read_sasl_auth_message(stream, 12).await
 }
 
 #[cfg(test)]

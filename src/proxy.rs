@@ -258,11 +258,8 @@ async fn handle_connection(
         "session ready — entering byte-forward mode"
     );
 
-    // Step 13: Byte-forward
-    let (mut cr, mut cw) = tokio::io::split(client);
-    let (mut br, mut bw) = tokio::io::split(backend);
-    tokio::io::copy(&mut cr, &mut bw).await?;
-    tokio::io::copy(&mut br, &mut cw).await?;
+    // Step 13: Byte-forward (bidirectional, concurrent)
+    tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
 
     let duration = start.elapsed();
     tracing::info!(
@@ -288,7 +285,7 @@ fn parse_backend_url(url: &str) -> Result<(String, u16, String, String, String),
     let (user, password) = creds
         .split_once(':')
         .ok_or_else(|| ProxyError::InvalidStartup("backend URL missing password".into()))?;
-    let (host_port, _db_part) = rest
+    let (host_port, db_and_query) = rest
         .split_once('/')
         .ok_or_else(|| ProxyError::InvalidStartup("backend URL missing '/db'".into()))?;
     let (host_port, _query) = host_port.split_once('?').unwrap_or((host_port, ""));
@@ -298,11 +295,8 @@ fn parse_backend_url(url: &str) -> Result<(String, u16, String, String, String),
     let port: u16 = port_str
         .parse()
         .map_err(|_| ProxyError::InvalidStartup("invalid backend port".into()))?;
-    let database = _query
-        .split('&')
-        .find(|p| p.starts_with("dbname="))
-        .map(|p| &p[7..])
-        .unwrap_or("postgres");
+    // Database name is the path component before any '?'
+    let database = db_and_query.split('?').next().filter(|s| !s.is_empty()).unwrap_or("postgres");
     Ok((host.to_string(), port, user.to_string(), password.to_string(), database.to_string()))
 }
 

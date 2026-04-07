@@ -76,18 +76,25 @@ where
 }
 
 /// Read a PasswordMessage from the client.
+/// Wire format: Byte1('p') + Int32(len) + String(password, null-terminated)
 pub async fn read_password_message<S>(stream: &mut S) -> Result<String, ProxyError>
 where
     S: AsyncReadExt + Unpin,
 {
+    let mut type_buf = [0u8; 1];
+    stream.read_exact(&mut type_buf).await?;
+    if type_buf[0] != b'p' {
+        return Err(ProxyError::ProtocolViolation(format!(
+            "expected PasswordMessage ('p'), got 0x{:02x}",
+            type_buf[0]
+        )));
+    }
     let len = read_message_length(stream).await?;
     let mut buf = vec![0u8; (len - 4) as usize];
     stream.read_exact(&mut buf).await?;
-    // First byte is 'p', rest is password string
-    if buf.is_empty() || buf[0] != b'p' {
-        return Err(ProxyError::ProtocolViolation("expected PasswordMessage".into()));
-    }
-    let password = std::str::from_utf8(&buf[1..])
+    // Strip null terminator
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let password = std::str::from_utf8(&buf[..end])
         .map_err(|_| ProxyError::ProtocolViolation("invalid UTF-8 in password".into()))?
         .to_string();
     Ok(password)
@@ -102,7 +109,7 @@ where
 {
     let mut buf = [0u8; 9]; // 'R' + len(4) + auth_type(4)
     buf[0] = b'R';
-    buf[1..5].copy_from_slice(&9u32.to_be_bytes());
+    buf[1..5].copy_from_slice(&8u32.to_be_bytes()); // length = 4 (self) + 4 (auth_type) = 8
     buf[5..9].copy_from_slice(&3u32.to_be_bytes());
     stream.write_all(&buf).await?;
     stream.flush().await?;
@@ -116,7 +123,7 @@ where
 {
     let mut buf = [0u8; 9];
     buf[0] = b'R';
-    buf[1..5].copy_from_slice(&9u32.to_be_bytes());
+    buf[1..5].copy_from_slice(&8u32.to_be_bytes()); // length = 4 (self) + 4 (auth_type) = 8
     buf[5..9].copy_from_slice(&0u32.to_be_bytes());
     stream.write_all(&buf).await?;
     Ok(())
@@ -139,7 +146,8 @@ where
     buf.push(0);
     buf.extend_from_slice(value.as_bytes());
     buf.push(0);
-    let len = buf.len() as u32;
+    // length = buf.len() - 1 (excludes the type byte 'S')
+    let len = (buf.len() - 1) as u32;
     buf[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
     stream.write_all(&buf).await?;
     Ok(())
@@ -205,7 +213,8 @@ where
     // Terminator
     buf.push(0);
 
-    let len = buf.len() as u32;
+    // length = buf.len() - 1 (excludes the type byte 'E')
+    let len = (buf.len() - 1) as u32;
     buf[len_pos..len_pos + 4].copy_from_slice(&len.to_be_bytes());
     stream.write_all(&buf).await?;
     stream.flush().await?;
