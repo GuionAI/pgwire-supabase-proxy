@@ -1,29 +1,31 @@
 //! Integration tests for pgwire-supabase-proxy
 //!
 //! These tests spawn the proxy in-process against a real Postgres backend
-//! (orbstack postgres-dev at 192.168.194.227:5432) and exercise it by spawning
-//! the real flicknote CLI binary with a valid JWT.
-//!
-//! Run with:
-//!   cargo test --test integration -- --ignored
+//! (orbstack postgres-dev) and exercise it by spawning the real flicknote CLI
+//! binary with a valid JWT.
 //!
 //! Prerequisites:
-//!   - Postgres at 192.168.194.227:5432 reachable from the host
+//!   - kubectl context pointing at orbstack
+//!   - postgres-dev svc deployed in the orbstack cluster
 //!   - flicknote binary at ~/.cargo/bin/flicknote
-//!   - Schema deployed via db-init (no bootstrap needed)
+//!
+//! Run with (from repo root):
+//!   ./scripts/run-integration-tests.sh
+//!   cargo test --test integration -- --ignored
 
 use pgwire_supabase_proxy::{serve, Config, Claims};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
-/// Postgres backend connection info (orbstack postgres-dev).
-const BACKEND_HOST: &str = "192.168.194.227";
-const BACKEND_PORT: u16 = 5432;
+/// Postgres backend connection info — port-forward must be running on 127.0.0.1:5433.
+/// The test runner script (`scripts/run-integration-tests.sh`) manages this.
+const BACKEND_HOST: &str = "127.0.0.1";
+const BACKEND_PORT: u16 = 5433;
 const BACKEND_USER: &str = "supabase_admin";
 const BACKEND_PASSWORD: &str = "dev-password";
 const BACKEND_DB: &str = "supabase";
@@ -67,14 +69,13 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
 
     let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    // Spawn the server
     tokio::spawn(async move {
         let _ = serve(config, listener, async move {
             let _ = shutdown_rx.await;
-        }).await;
+        })
+        .await;
     });
 
-    // Wait for the server to be ready
     let mut attempts = 0;
     loop {
         attempts += 1;
@@ -87,7 +88,7 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
         sleep(Duration::from_millis(20)).await;
     }
 
-    sleep(Duration::from_millis(50)).await; // extra settle time
+    sleep(Duration::from_millis(50)).await;
     port
 }
 
@@ -120,7 +121,7 @@ async fn run_flicknote(port: u16, jwt: &str, args: &[&str]) -> (bool, String) {
         jwt, port
     );
 
-    let mut cmd = Command::new(flicknote_path());
+    let mut cmd = TokioCommand::new(flicknote_path());
     cmd.env("FLICKNOTE_TOKEN", jwt)
         .env("DATABASE_URL", &db_url)
         .env("RUST_LOG", "warn")
@@ -144,7 +145,6 @@ async fn cleanup_notes(database_url: &str, _jwt: &str) {
         }
     });
 
-    // Run cleanup as the test user (via SET ROLE)
     let cleanup_sql = format!(
         "SET ROLE authenticated; \
          SET request.jwt.claim.sub = '{}'; \
@@ -154,7 +154,7 @@ async fn cleanup_notes(database_url: &str, _jwt: &str) {
     let _ = client.batch_execute(&cleanup_sql).await;
 }
 
-/// Build the DATABASE_URL for direct Postgres connections (admin).
+/// Build DATABASE_URL for direct Postgres connections.
 fn admin_database_url() -> String {
     format!(
         "host={} port={} user={} password={} dbname={}",
@@ -162,7 +162,6 @@ fn admin_database_url() -> String {
     )
 }
 
-/// Build the DATABASE_URL for the PSP config (psp connects as superuser to build per-user pools).
 fn psp_database_url() -> String {
     format!(
         "host={} port={} user={} password={} dbname={}",
@@ -171,15 +170,12 @@ fn psp_database_url() -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
 
-    // Patch auth.uid() so RLS works
     patch_auth_uid(&admin_url).await;
-
-    // Spawn psp
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
@@ -190,7 +186,6 @@ async fn integration_note_list() {
         "note list failed (exit != 0):\nstdout:\n{}\n",
         stdout
     );
-    // Should produce JSON output with notes array (possibly empty)
     assert!(
         stdout.trim().starts_with('[') || stdout.trim().starts_with('{'),
         "note list should produce JSON:\n{}",
@@ -201,7 +196,7 @@ async fn integration_note_list() {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list_json() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
@@ -222,7 +217,7 @@ async fn integration_note_list_json() {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_count() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
@@ -234,7 +229,6 @@ async fn integration_note_count() {
     let (status, stdout) = run_flicknote(port, &jwt, &["note", "count"]).await;
 
     assert!(status, "note count failed:\nstdout:\n{}\n", stdout);
-    // Output should contain a number
     assert!(
         stdout.trim().parse::<u64>().is_ok(),
         "note count should output a number:\n{}",
@@ -244,7 +238,7 @@ async fn integration_note_count() {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_find() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
@@ -260,7 +254,7 @@ async fn integration_note_find() {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_project_list() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
@@ -280,7 +274,7 @@ async fn integration_note_project_list() {
 }
 
 #[tokio::test]
-#[ignore = "requires orbstack postgres-dev at 192.168.194.227:5432"]
+#[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_add() {
     let admin_url = admin_database_url();
     let psp_db_url = psp_database_url();
