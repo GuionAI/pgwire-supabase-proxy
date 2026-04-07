@@ -23,12 +23,45 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 /// Postgres backend connection info — port-forward must be running on 127.0.0.1:5433.
-/// The test runner script (`scripts/run-integration-tests.sh`) manages this.
 const BACKEND_HOST: &str = "127.0.0.1";
 const BACKEND_PORT: u16 = 5433;
 const BACKEND_USER: &str = "supabase_admin";
 const BACKEND_PASSWORD: &str = "dev-password";
 const BACKEND_DB: &str = "supabase";
+
+/// One-time setup: patch auth.uid() once before any test runs.
+/// Runs in a blocking thread to avoid conflicts with the test Tokio runtime.
+static SETUP_DONE: std::sync::Once = std::sync::Once::new();
+
+fn ensure_setup() {
+    SETUP_DONE.call_once(|| {
+        let url = format!(
+            "host={} port={} user={} password={} dbname={}",
+            BACKEND_HOST, BACKEND_PORT, BACKEND_USER, BACKEND_PASSWORD, BACKEND_DB
+        );
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (client, connection) =
+                tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                    .await
+                    .expect("failed to connect to postgres for auth.uid patch");
+
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("setup postgres connection error: {}", e);
+                }
+            });
+
+            client
+                .batch_execute(
+                    "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
+                     SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
+                )
+                .await
+                .expect("failed to patch auth.uid()");
+        });
+    });
+}
 
 /// Test JWT secret — must match what psp is configured with.
 const TEST_JWT_SECRET: &str = "test-jwt-secret-for-integration-testing-only";
@@ -92,28 +125,6 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
     port
 }
 
-/// Patch auth.uid() via direct Postgres connection as superuser.
-/// This makes auth.uid() read from current_setting('request.jwt.claim.sub').
-async fn patch_auth_uid(database_url: &str) {
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-        .await
-        .expect("failed to connect to postgres for auth.uid patch");
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("postgres connection error: {}", e);
-        }
-    });
-
-    client
-        .batch_execute(
-            "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
-             SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
-        )
-        .await
-        .expect("failed to patch auth.uid()");
-}
-
 /// Run a flicknote command, return exit status and stdout.
 async fn run_flicknote(port: u16, jwt: &str, args: &[&str]) -> (bool, String) {
     let db_url = format!(
@@ -133,35 +144,7 @@ async fn run_flicknote(port: u16, jwt: &str, args: &[&str]) -> (bool, String) {
     (success, stdout)
 }
 
-/// Clean up test notes created during the test.
-async fn cleanup_notes(database_url: &str, _jwt: &str) {
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
-        .await
-        .expect("failed to connect for cleanup");
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("cleanup connection error: {}", e);
-        }
-    });
-
-    let cleanup_sql = format!(
-        "SET ROLE authenticated; \
-         SET request.jwt.claim.sub = '{}'; \
-         DELETE FROM notes WHERE title LIKE '__psp_it__%';",
-        TEST_USER_ID
-    );
-    let _ = client.batch_execute(&cleanup_sql).await;
-}
-
-/// Build DATABASE_URL for direct Postgres connections.
-fn admin_database_url() -> String {
-    format!(
-        "host={} port={} user={} password={} dbname={}",
-        BACKEND_HOST, BACKEND_PORT, BACKEND_USER, BACKEND_PASSWORD, BACKEND_DB
-    )
-}
-
+/// Build DATABASE_URL for PSP backend connection.
 fn psp_database_url() -> String {
     format!(
         "host={} port={} user={} password={} dbname={}",
@@ -172,36 +155,26 @@ fn psp_database_url() -> String {
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
     let (status, stdout) = run_flicknote(port, &jwt, &["note", "list"]).await;
 
-    assert!(
-        status,
-        "note list failed (exit != 0):\nstdout:\n{}\n",
-        stdout
-    );
+    assert!(status, "note list failed (exit != 0):\nstdout:\n{}\n", stdout);
     assert!(
         stdout.trim().starts_with('[') || stdout.trim().starts_with('{'),
         "note list should produce JSON:\n{}",
         stdout
     );
-
-    cleanup_notes(&admin_url, &jwt).await;
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_list_json() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
@@ -213,16 +186,13 @@ async fn integration_note_list_json() {
         "note list --json should produce a JSON array:\n{}",
         stdout
     );
-    cleanup_notes(&admin_url, &jwt).await;
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_count() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
@@ -234,52 +204,39 @@ async fn integration_note_count() {
         "note count should output a number:\n{}",
         stdout
     );
-    cleanup_notes(&admin_url, &jwt).await;
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_find() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
     let (status, stdout) = run_flicknote(port, &jwt, &["note", "find", "test"]).await;
 
     assert!(status, "note find failed:\nstdout:\n{}\n", stdout);
-    cleanup_notes(&admin_url, &jwt).await;
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_project_list() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
     let (status, stdout) = run_flicknote(port, &jwt, &["note", "project", "list"]).await;
 
-    assert!(
-        status,
-        "note project list failed:\nstdout:\n{}\n",
-        stdout
-    );
-    cleanup_notes(&admin_url, &jwt).await;
+    assert!(status, "note project list failed:\nstdout:\n{}\n", stdout);
 }
 
 #[tokio::test]
 #[ignore = "requires orbstack cluster — run ./scripts/run-integration-tests.sh"]
 async fn integration_note_add() {
-    let admin_url = admin_database_url();
+    ensure_setup();
     let psp_db_url = psp_database_url();
-
-    patch_auth_uid(&admin_url).await;
     let port = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
@@ -290,10 +247,5 @@ async fn integration_note_add() {
     )
     .await;
 
-    assert!(
-        status,
-        "note add failed:\nstdout:\n{}\n",
-        stdout
-    );
-    cleanup_notes(&admin_url, &jwt).await;
+    assert!(status, "note add failed:\nstdout:\n{}\n", stdout);
 }
