@@ -63,11 +63,7 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
 
-    let config = Config {
-        database_url,
-        jwt_secret,
-        max_connections: 5,
-    };
+    let config = Config::new(database_url, jwt_secret, format!("127.0.0.1:{}", port)).unwrap();
 
     let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 

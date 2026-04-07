@@ -8,27 +8,27 @@ pub enum ProxyError {
     #[error("JWT expired")]
     JwtExpired,
 
-    #[error("database error: {0}")]
-    Database(#[from] tokio_postgres::Error),
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(String),
 
-    #[error("pool error: {0}")]
-    Pool(#[from] deadpool_postgres::PoolError),
+    #[error("backend auth error: {0}")]
+    BackendAuth(String),
 
-    #[error("pgwire error: {0}")]
-    PgWire(#[from] pgwire::error::PgWireError),
-
-    #[error("invalid startup: {0}")]
-    InvalidStartup(String),
+    #[error("backend error: {0}")]
+    BackendError(String),
 
     #[error("connection closed")]
     ConnectionClosed,
 
     #[error("encoding error: {0}")]
     Encoding(String),
-}
 
-impl From<ProxyError> for pgwire::error::PgWireError {
-    fn from(e: ProxyError) -> Self {
-        pgwire::error::PgWireError::ApiError(Box::new(e))
-    }
+    #[error("invalid startup: {0}")]
+    InvalidStartup(String),
+
+    #[error("TLS error: {0}")]
+    Tls(String),
+
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
