@@ -36,6 +36,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hmac = "0.12"
 sha2 = "0.10"
 
+# Base64 (SCRAM)
+base64 = "0.22"
+
 # Random
 rand = "0.8"
 

@@ -4,8 +4,6 @@
 //! the byte-forward proxy: client auth (JWT), backend auth (SCRAM), and
 //! handshake message exchange. After handshake, all bytes are forwarded transparently.
 
-#![allow(dead_code)]
-
 use crate::error::ProxyError;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Represents a parsed StartupMessage.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StartupMessage {
     pub protocol_version: u32,
     pub params: HashMap<String, String>,
@@ -60,19 +59,6 @@ pub fn parse_startup_body(_msg_len: u32, buf: &[u8]) -> Result<StartupMessage, P
         protocol_version,
         params,
     })
-}
-
-/// Read a StartupMessage from the client stream.
-pub async fn read_startup_message<S>(stream: &mut S) -> Result<StartupMessage, ProxyError>
-where
-    S: AsyncReadExt + Unpin,
-{
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf);
-    let mut buf = vec![0u8; (msg_len - 4) as usize];
-    stream.read_exact(&mut buf).await?;
-    parse_startup_body(msg_len, &buf)
 }
 
 /// Read a PasswordMessage from the client.
@@ -223,19 +209,6 @@ where
 
 // ─── Proxy → Backend messages ────────────────────────────────────────────────
 
-/// Write SSLRequest (8 bytes: length=8, code=80877103).
-pub async fn write_ssl_request<S>(stream: &mut S) -> Result<(), ProxyError>
-where
-    S: AsyncWriteExt + Unpin,
-{
-    let mut buf = [0u8; 8];
-    buf[0..4].copy_from_slice(&8u32.to_be_bytes());
-    buf[4..8].copy_from_slice(&80877103u32.to_be_bytes());
-    stream.write_all(&buf).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
 /// Write a StartupMessage to the backend.
 pub async fn write_startup_message<S>(
     stream: &mut S,
@@ -296,7 +269,7 @@ where
     Ok(())
 }
 
-// ─── Backend → Proxy messages ────────────────────────────────────────────────
+// ─── Backend → Proxy messages ───────────────────────────────────────────────
 
 async fn read_message_length<S>(stream: &mut S) -> Result<u32, ProxyError>
 where
@@ -309,6 +282,7 @@ where
 
 /// Authentication method received from the backend.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AuthMethod {
     Ok,
     CleartextPassword,
@@ -363,16 +337,27 @@ where
 
 /// Backend message types we care about during handshake drain.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum BackendMessage {
-    ReadyForQuery { transaction_status: u8 },
-    ParameterStatus { key: String, value: String },
-    BackendKeyData { process_id: i32, secret_key: i32 },
+    ReadyForQuery {
+        transaction_status: u8,
+    },
+    ParameterStatus {
+        key: String,
+        value: String,
+    },
+    BackendKeyData {
+        process_id: i32,
+        secret_key: i32,
+    },
     ErrorResponse {
         severity: Option<String>,
         code: Option<String>,
         message: String,
     },
-    Unknown { tag: u8 },
+    Unknown {
+        tag: u8,
+    },
 }
 
 /// Read a backend message (during handshake drain phase).
@@ -391,7 +376,9 @@ where
     match tag {
         b'Z' => {
             let status = body.first().copied().unwrap_or(b'I');
-            Ok(BackendMessage::ReadyForQuery { transaction_status: status })
+            Ok(BackendMessage::ReadyForQuery {
+                transaction_status: status,
+            })
         }
         b'S' => {
             let (key, rest) = split_null(&body);
@@ -404,7 +391,10 @@ where
         b'K' => {
             let process_id = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
             let secret_key = i32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-            Ok(BackendMessage::BackendKeyData { process_id, secret_key })
+            Ok(BackendMessage::BackendKeyData {
+                process_id,
+                secret_key,
+            })
         }
         b'E' => {
             let mut severity = None;
@@ -428,9 +418,16 @@ where
                     _ => {}
                 }
             }
-            Ok(BackendMessage::ErrorResponse { severity, code, message })
+            Ok(BackendMessage::ErrorResponse {
+                severity,
+                code,
+                message,
+            })
         }
-        _ => Ok(BackendMessage::Unknown { tag }),
+        _ => {
+            tracing::warn!(tag, "unknown backend message during handshake");
+            Ok(BackendMessage::Unknown { tag })
+        }
     }
 }
 

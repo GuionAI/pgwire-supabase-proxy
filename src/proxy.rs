@@ -6,20 +6,11 @@ use crate::scram;
 use crate::wire;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Global cancel-key map: (backend_pid, backend_secret) → (client_pid, client_secret).
-/// v1: entries are inserted but never looked up (cancel support deferred).
-type CancelKey = (i32, i32);
-static CANCEL_KEYS: std::sync::OnceLock<Mutex<HashMap<CancelKey, CancelKey>>> =
-    std::sync::OnceLock::new();
 
-fn cancel_keys() -> &'static Mutex<HashMap<CancelKey, CancelKey>> {
-    CANCEL_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 /// Start the byte-forward proxy server.
 pub async fn serve(
@@ -133,7 +124,10 @@ async fn handle_connection(
         wire::write_error_response(&mut client, "28P01", "invalid sub claim").await?;
         return Ok(());
     }
-    if !jwt_sub.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !jwt_sub
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         wire::write_error_response(&mut client, "28P01", "invalid sub claim format").await?;
         return Ok(());
     }
@@ -142,7 +136,14 @@ async fn handle_connection(
     let (backend_host, backend_port, backend_user, backend_password, backend_db) =
         parse_backend_url(&config.backend_postgres_url)?;
 
-    let mut backend = tokio::net::TcpStream::connect((backend_host.as_str(), backend_port)).await?;
+    let mut backend = match tokio::net::TcpStream::connect((backend_host.as_str(), backend_port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(peer_addr = %peer_addr, error = %e, "backend TCP connect failed");
+            wire::write_error_response(&mut client, "08001", &format!("backend connection failed: {}", e)).await?;
+            return Ok(());
+        }
+    };
     tracing::debug!(peer_addr = %peer_addr, backend = %backend_host, "backend TCP opened");
 
     // Step 7: Send backend StartupMessage (plain TCP, no TLS)
@@ -196,7 +197,11 @@ async fn handle_connection(
                     "backend key data received"
                 );
             }
-            wire::BackendMessage::ErrorResponse { severity, code, message } => {
+            wire::BackendMessage::ErrorResponse {
+                severity,
+                code,
+                message,
+            } => {
                 return Err(Box::new(ProxyError::BackendError(format!(
                     "{} {}: {}",
                     severity.unwrap_or_default(),
@@ -247,7 +252,6 @@ async fn handle_connection(
     }
     let client_pid: i32 = rand::random();
     let client_secret: i32 = rand::random();
-    cancel_keys().lock().unwrap().insert((client_pid, client_secret), (client_pid, client_secret));
     wire::write_backend_key_data(&mut client, client_pid, client_secret).await?;
     wire::write_ready_for_query(&mut client, b'I').await?;
     client.flush().await?;
@@ -259,16 +263,30 @@ async fn handle_connection(
     );
 
     // Step 13: Byte-forward (bidirectional, concurrent)
-    tokio::io::copy_bidirectional(&mut client, &mut backend).await?;
+    let result = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
 
-    let duration = start.elapsed();
-    tracing::info!(
-        peer_addr = %peer_addr,
-        user_id = %jwt_sub,
-        duration_ms = duration.as_millis() as u64,
-        close_reason = "both sides closed",
-        "connection closed"
-    );
+    match result {
+        Ok((bytes_to_backend, bytes_to_client)) => {
+            tracing::info!(
+                peer_addr = %peer_addr,
+                user_id = %jwt_sub,
+                duration_ms = start.elapsed().as_millis() as u64,
+                bytes_to_backend,
+                bytes_to_client,
+                close_reason = "both sides closed",
+                "connection closed"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                peer_addr = %peer_addr,
+                user_id = %jwt_sub,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %e,
+                "connection closed with error"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -289,15 +307,23 @@ fn parse_backend_url(url: &str) -> Result<(String, u16, String, String, String),
         .split_once('/')
         .ok_or_else(|| ProxyError::InvalidStartup("backend URL missing '/db'".into()))?;
     let (host_port, _query) = host_port.split_once('?').unwrap_or((host_port, ""));
-    let (host, port_str) = host_port
-        .split_once(':')
-        .unwrap_or((host_port, "5432"));
+    let (host, port_str) = host_port.split_once(':').unwrap_or((host_port, "5432"));
     let port: u16 = port_str
         .parse()
         .map_err(|_| ProxyError::InvalidStartup("invalid backend port".into()))?;
     // Database name is the path component before any '?'
-    let database = db_and_query.split('?').next().filter(|s| !s.is_empty()).unwrap_or("postgres");
-    Ok((host.to_string(), port, user.to_string(), password.to_string(), database.to_string()))
+    let database = db_and_query
+        .split('?')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("postgres");
+    Ok((
+        host.to_string(),
+        port,
+        user.to_string(),
+        password.to_string(),
+        database.to_string(),
+    ))
 }
 
 fn escape_pg_string(s: &str) -> String {

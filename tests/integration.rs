@@ -13,8 +13,8 @@
 //!   ./scripts/run-integration-tests.sh
 //!   cargo test --test integration -- --ignored
 
-use pgwire_supabase_proxy::{serve, Config, Claims};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use pgwire_supabase_proxy::{serve, Claims, Config};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -72,10 +72,11 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> (u16, oneshot::S
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        let _ = serve(config, listener, async move {
+        serve(config, listener, async move {
             let _ = shutdown_rx.await;
         })
-        .await;
+        .await
+        .expect("psp server error");
     });
 
     let mut attempts = 0;
@@ -139,27 +140,28 @@ fn psp_connection_string() -> String {
 static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 async fn ensure_setup() {
-    SETUP.get_or_init(|| async {
-        let url = psp_connection_string();
-        let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
-            .await
-            .expect("failed to connect to postgres for auth.uid patch");
+    SETUP
+        .get_or_init(|| async {
+            let url = psp_connection_string();
+            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+                .await
+                .expect("failed to connect to postgres for auth.uid patch");
 
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                eprintln!("setup postgres connection error: {}", e);
-            }
-        });
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("setup postgres connection error: {}", e);
+                }
+            });
 
-        client
-            .batch_execute(
-                "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
+            client
+                .batch_execute(
+                    "CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ \
                  SELECT nullif(current_setting('request.jwt.claim.sub', true), '')::uuid $$;",
-            )
-            .await
-            .expect("failed to patch auth.uid()");
-    })
-    .await;
+                )
+                .await
+                .expect("failed to patch auth.uid()");
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -245,12 +247,8 @@ async fn integration_note_add() {
     let (port, _shutdown) = spawn_psp(psp_db_url, TEST_JWT_SECRET.to_string()).await;
 
     let jwt = mint_jwt(TEST_USER_ID);
-    let (status, stdout) = run_flicknote(
-        port,
-        &jwt,
-        &["add", "__psp_it__integration test note"],
-    )
-    .await;
+    let (status, stdout) =
+        run_flicknote(port, &jwt, &["add", "__psp_it__integration test note"]).await;
 
     assert!(status, "note add failed:\nstdout:\n{}\n", stdout);
 }

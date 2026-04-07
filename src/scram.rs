@@ -1,6 +1,7 @@
 //! SCRAM-SHA-256 client authentication helper.
 
 use crate::error::ProxyError;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
@@ -52,17 +53,7 @@ where
     }
 
     // Step 3: ClientFinal
-    let client_final_without_proof = format!(
-        "c=biws,r={}",
-        sf.server_nonce
-    );
-
-    let _auth_message_full = format!(
-        "{},{},{}",
-        client_first_bare,
-        server_first_str,
-        client_final_without_proof
-    );
+    let client_final_without_proof = format!("c=biws,r={}", sf.server_nonce);
 
     let client_proof = compute_client_proof(
         password,
@@ -129,7 +120,10 @@ fn parse_server_first(s: &str) -> Result<ServerFirst, ProxyError> {
     if let Some(r_pos) = s.find("r=") {
         // Extract r= value: from "r=" up to the last ",s=" or ",i="
         let after_r = &s[r_pos + 2..];
-        let end = after_r.rfind(",s=").or(after_r.rfind(",i=")).unwrap_or(after_r.len());
+        let end = after_r
+            .rfind(",s=")
+            .or(after_r.rfind(",i="))
+            .unwrap_or(after_r.len());
         server_nonce = Some(after_r[..end].to_string());
     }
 
@@ -138,24 +132,29 @@ fn parse_server_first(s: &str) -> Result<ServerFirst, ProxyError> {
         let parts: Vec<&str> = rest.splitn(2, ",i=").collect();
         salt = Some(base64_decode(parts[0]).map_err(|e| ProxyError::BackendAuth(e.to_string()))?);
         if parts.len() > 1 {
-            iter_count = Some(parts[1].parse().map_err(|_| {
-                ProxyError::BackendAuth("invalid iteration count".into())
-            })?);
+            iter_count = Some(
+                parts[1]
+                    .parse()
+                    .map_err(|_| ProxyError::BackendAuth("invalid iteration count".into()))?,
+            );
         }
     }
     // Handle i= without s= (fallback)
     if iter_count.is_none() {
         if let Some(rest) = s.split(",i=").nth(1) {
-            iter_count = Some(rest.parse().map_err(|_| {
-                ProxyError::BackendAuth("invalid iteration count".into())
-            })?);
+            iter_count = Some(
+                rest.parse()
+                    .map_err(|_| ProxyError::BackendAuth("invalid iteration count".into()))?,
+            );
         }
     }
 
     Ok(ServerFirst {
         salt: salt.ok_or_else(|| ProxyError::BackendAuth("missing salt".into()))?,
-        iteration_count: iter_count.ok_or_else(|| ProxyError::BackendAuth("missing iteration count".into()))?,
-        server_nonce: server_nonce.ok_or_else(|| ProxyError::BackendAuth("missing server nonce".into()))?,
+        iteration_count: iter_count
+            .ok_or_else(|| ProxyError::BackendAuth("missing iteration count".into()))?,
+        server_nonce: server_nonce
+            .ok_or_else(|| ProxyError::BackendAuth("missing server nonce".into()))?,
     })
 }
 
@@ -218,14 +217,16 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Result<Vec<u8>, ProxyErr
     let mut result = vec![0u8; 32];
     let mut u = vec![0u8; 32];
 
-    let mut mac = HmacSha256::new_from_slice(password).map_err(|e| ProxyError::BackendAuth(e.to_string()))?;
+    let mut mac =
+        HmacSha256::new_from_slice(password).map_err(|e| ProxyError::BackendAuth(e.to_string()))?;
     mac.update(salt);
     mac.update(&1u32.to_be_bytes());
     u.copy_from_slice(&mac.finalize().into_bytes());
     result.copy_from_slice(&u); // XOR in U1 (result is zeroed, so copy = XOR)
 
     for _ in 2..=iterations {
-        let mut mac = HmacSha256::new_from_slice(password).map_err(|e| ProxyError::BackendAuth(e.to_string()))?;
+        let mut mac = HmacSha256::new_from_slice(password)
+            .map_err(|e| ProxyError::BackendAuth(e.to_string()))?;
         mac.update(&u);
         u.copy_from_slice(&mac.finalize().into_bytes());
         for i in 0..32 {
@@ -268,75 +269,13 @@ fn join_bytes(parts: &[&[u8]]) -> Vec<u8> {
 }
 
 fn base64_encode(data: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-        result.push(ALPHABET[b0 >> 2] as char);
-        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        if chunk.len() > 1 {
-            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(ALPHABET[b2 & 0x3f] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
+    BASE64.encode(data)
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, &'static str> {
-    // Static decode lookup table built lazily once
-    fn make_decode_table() -> [i8; 256] {
-        let mut d = [-1i8; 256];
-        // A-Z: 0-25
-        d[65] = 0; d[66] = 1; d[67] = 2; d[68] = 3; d[69] = 4; d[70] = 5; d[71] = 6; d[72] = 7; d[73] = 8; d[74] = 9;
-        d[75] = 10; d[76] = 11; d[77] = 12; d[78] = 13; d[79] = 14; d[80] = 15; d[81] = 16; d[82] = 17; d[83] = 18; d[84] = 19;
-        d[85] = 20; d[86] = 21; d[87] = 22; d[88] = 23; d[89] = 24; d[90] = 25;
-        // a-z: 26-51
-        d[97] = 26; d[98] = 27; d[99] = 28; d[100] = 29; d[101] = 30; d[102] = 31; d[103] = 32; d[104] = 33; d[105] = 34; d[106] = 35;
-        d[107] = 36; d[108] = 37; d[109] = 38; d[110] = 39; d[111] = 40; d[112] = 41; d[113] = 42; d[114] = 43; d[115] = 44; d[116] = 45;
-        d[117] = 46; d[118] = 47; d[119] = 48; d[120] = 49; d[121] = 50; d[122] = 51;
-        // 0-9: 52-61
-        d[48] = 52; d[49] = 53; d[50] = 54; d[51] = 55; d[52] = 56; d[53] = 57; d[54] = 58; d[55] = 59; d[56] = 60; d[57] = 61;
-        // +/: 62-63
-        d[43] = 62; // '+'
-        d[47] = 63; // '/'
-        d
-    }
-    use std::sync::LazyLock;
-    static DECODE: LazyLock<[i8; 256], fn() -> [i8; 256]> = LazyLock::new(make_decode_table);
-
-    let s = s.trim_end_matches('=');
-    let mut result = Vec::with_capacity(s.len() * 3 / 4);
-    let mut buf = [0u8; 4];
-    let mut j = 0usize;
-    for c in s.chars() {
-        let c = c as usize;
-        if c >= 256 || DECODE[c] < 0 {
-            return Err("invalid base64");
-        }
-        buf[j] = DECODE[c] as u8;
-        j += 1;
-        if j == 4 {
-            result.push((buf[0] << 2) | (buf[1] >> 4));
-            result.push((buf[1] << 4) | (buf[2] >> 2));
-            result.push((buf[2] << 6) | buf[3]);
-            j = 0;
-        }
-    }
-    if j > 0 {
-        result.push((buf[0] << 2) | (buf[1] >> 4));
-        if j > 2 {
-            result.push((buf[1] << 4) | (buf[2] >> 2));
-        }
-    }
-    Ok(result)
+    BASE64
+        .decode(s)
+        .map_err(|_| "invalid base64")
 }
 
 // ─── Wire framing helpers ────────────────────────────────────────────────────
@@ -381,7 +320,10 @@ where
     Ok(())
 }
 
-async fn read_sasl_auth_message<S>(stream: &mut S, expected_type: u32) -> Result<Vec<u8>, ProxyError>
+async fn read_sasl_auth_message<S>(
+    stream: &mut S,
+    expected_type: u32,
+) -> Result<Vec<u8>, ProxyError>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -443,7 +385,8 @@ mod tests {
 
     #[test]
     fn test_parse_server_first_valid() {
-        let s = "r=fyko+d2lbbFgONe9WqKkE2qtVdgo,+5qdLY9Rw=,s=QSXCRQD6Yt6AS+kWSMEpqhGkg5e/klE+,i=4096";
+        let s =
+            "r=fyko+d2lbbFgONe9WqKkE2qtVdgo,+5qdLY9Rw=,s=QSXCRQD6Yt6AS+kWSMEpqhGkg5e/klE+,i=4096";
         let sf = parse_server_first(s).unwrap();
         assert_eq!(sf.server_nonce, "fyko+d2lbbFgONe9WqKkE2qtVdgo,+5qdLY9Rw=");
         assert_eq!(sf.iteration_count, 4096);
@@ -472,4 +415,23 @@ mod tests {
         assert_eq!(sig1, sig2);
         assert_eq!(sig1.len(), 32); // SHA256 output = 32 bytes
     }
+
+    #[test]
+    fn test_hi_includes_first_iteration() {
+        // Regression test: hi() must XOR in U1 (the first HMAC iteration).
+        // Without this, only iterations 2..n are XORed, giving a wrong result.
+        // Test vector from RFC 6070 / test vectors for PBKDF2-SHA256:
+        // password="password", salt="salt", c=4096, DK=120fb06c...
+        let password = b"password";
+        let salt = b"salt";
+        let iterations = 4096;
+        let result = hi(password, salt, iterations).expect("hi should succeed");
+        // RFC 6070 test vector: PBKDF2-SHA256("password", "salt", 4096)
+        assert_eq!(
+            &result[..4],
+            &[0xc5, 0xe4, 0x78, 0xd5],
+            "hi() must XOR in U1 (first iteration); without it the result is wrong"
+        );
+    }
+
 }

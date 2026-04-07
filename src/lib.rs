@@ -28,7 +28,11 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn new(backend_postgres_url: String, jwt_secret: String, listen_addr: String) -> Result<Self, ProxyError> {
+    pub fn new(
+        backend_postgres_url: String,
+        jwt_secret: String,
+        listen_addr: String,
+    ) -> Result<Self, ProxyError> {
         if backend_postgres_url.is_empty() {
             return Err(ProxyError::InvalidStartup(
                 "backend_postgres_url must be non-empty".into(),
