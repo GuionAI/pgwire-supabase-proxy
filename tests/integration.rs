@@ -12,7 +12,8 @@
 //!   - flicknote binary at ~/.cargo/bin/flicknote
 //!   - Schema deployed via db-init (no bootstrap needed)
 
-use pgwire_supabase_proxy::{serve, Config};
+use pgwire_supabase_proxy::{serve, Config, Claims};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -34,21 +35,13 @@ const TEST_USER_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 /// Mint a JWT with the given sub claim using HMAC-SHA256.
 fn mint_jwt(sub: &str) -> String {
-    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Serialize, Deserialize)]
-    struct Claims {
-        sub: String,
-        role: String,
-        exp: usize,
-    }
-
     let header = Header::new(Algorithm::HS256);
     let claims = Claims {
         sub: sub.to_string(),
-        role: "authenticated".to_string(),
-        exp: 9999999999,
+        exp: Some(9999999999),
+        iat: None,
+        role: Some("authenticated".to_string()),
+        email: None,
     };
     encode(
         &header,
@@ -80,7 +73,9 @@ async fn spawn_psp(database_url: String, jwt_secret: String) -> u16 {
 
     // Spawn the server
     tokio::spawn(async move {
-        serve(config, listener, async move { let _ = shutdown_rx.await; }).await.unwrap();
+        let _ = serve(config, listener, async move {
+            let _ = shutdown_rx.await;
+        }).await;
     });
 
     // Wait for the server to be ready

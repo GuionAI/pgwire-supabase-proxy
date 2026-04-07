@@ -8,7 +8,7 @@ mod error;
 mod handler;
 mod pool;
 
-pub use auth::{JwtAuthenticator, StartupHandler};
+pub use auth::{Claims, JwtAuthenticator, StartupHandler};
 pub use error::ProxyError;
 pub use handler::{ProxyQueryHandler, Session};
 pub use pool::ConnectionManager;
@@ -28,6 +28,23 @@ pub struct Config {
     pub jwt_secret: String,
     /// Max connections per pool.
     pub max_connections: usize,
+}
+
+impl Config {
+    pub fn new(database_url: String, jwt_secret: String, max_connections: usize) -> std::result::Result<Self, ProxyError> {
+        if database_url.is_empty() {
+            return Err(ProxyError::InvalidStartup("Config.database_url must be non-empty".into()));
+        }
+        if jwt_secret.len() < 8 {
+            return Err(ProxyError::InvalidStartup(
+                format!("Config.jwt_secret too short ({} bytes, minimum 8)", jwt_secret.len()),
+            ));
+        }
+        if max_connections == 0 {
+            return Err(ProxyError::InvalidStartup("Config.max_connections must be > 0".into()));
+        }
+        Ok(Self { database_url, jwt_secret, max_connections })
+    }
 }
 
 /// The `AppFactory` wires together auth, session, and query handlers for pgwire.

@@ -16,7 +16,6 @@ use pgwire::api::results::{
 };
 use pgwire::api::stmt::QueryParser;
 use postgres_types::{to_sql_checked, IsNull, ToSql};
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,6 +55,10 @@ impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut mutex_guard) = self.inner.try_lock() {
             let _conn = mutex_guard.take();
+        } else {
+            tracing::error!(
+                "Session::drop: try_lock failed (poisoned mutex) — backend connection not returned to pool"
+            );
         }
     }
 }
@@ -109,8 +112,9 @@ impl ProxyQueryHandler {
             }
         };
 
-        let messages = backend.simple_query(sql).await;
-
+        // Capture result first, restore backend before propagating.
+        // This prevents connection leaks when simple_query fails.
+        let result = backend.simple_query(sql).await;
         {
             let mut guard = self.session.inner.lock().await;
             if guard.is_none() {
@@ -118,7 +122,7 @@ impl ProxyQueryHandler {
             }
         }
 
-        Ok(messages)
+        Ok(result)
     }
 
     /// Parse raw `SimpleQueryMessage`s into columns + encoded rows.
@@ -247,6 +251,9 @@ impl pgwire::api::query::SimpleQueryHandler for ProxyQueryHandler {
 /// tokio-postgres prepared statements return rows in binary format by default.
 #[derive(Debug)]
 pub struct RawParam {
+    // NOTE: the type field is not used in to_sql (only format + bytes are needed).
+    // Kept for documentation and potential future use (e.g., validation).
+    #[allow(dead_code)]
     type_: Type,
     format: FieldFormat,
     bytes: Option<Bytes>,
@@ -374,150 +381,46 @@ fn decode_text_param(
 
 /// Encode a single column value from a tokio_postgres Row into the encoder.
 /// tokio-postgres prepared statements return rows in binary format by default.
+/// When the client requests Text format, we decode the binary bytes ourselves and
+/// re-encode as pgwire text; when it requests Binary, we pass raw bytes through.
 fn encode_column_value(
     row: &tokio_postgres::Row,
     idx: usize,
     oid: u32,
-    fmt: FieldFormat,
     encoder: &mut DataRowEncoder,
 ) -> PgWireResult<()> {
-    if fmt == FieldFormat::Binary {
-        match oid {
-            16 => {
-                let v: bool = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            21 => {
-                let v: i16 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            23 => {
-                let v: i32 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            20 => {
-                let v: i64 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            700 => {
-                let v: f32 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            701 => {
-                let v: f64 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            25 | 1043 | 19 | 142 | 705 | 1042 => {
-                // TEXT/VARCHAR/NAME/CHAR
-                let v: String = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            2950 => {
-                // UUID: tokio_postgres can decode UUID as String
-                let v: String = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            17 => {
-                // BYTEA
-                let v: Vec<u8> = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            114 | 3802 => {
-                // JSON/JSONB
-                let v: serde_json::Value = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1114 | 1184 => {
-                // TIMESTAMP/TIMESTAMPTZ
-                let v: chrono::NaiveDateTime = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1082 => {
-                // DATE
-                let v: chrono::NaiveDate = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1083 => {
-                // TIME
-                let v: chrono::NaiveTime = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1700 => {
-                // NUMERIC
-                let v: rust_decimal::Decimal = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "0A000".into(),
-                oid.to_string(),
-                format!("unsupported column type OID {}", oid),
-            )))),
-        }
-    } else {
-        // Text format
-        match oid {
-            16 => {
-                let v: bool = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            21 => {
-                let v: i16 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            23 => {
-                let v: i32 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            20 => {
-                let v: i64 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            700 => {
-                let v: f32 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            701 => {
-                let v: f64 = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            25 | 1043 | 19 | 142 | 705 | 1042 => {
-                let v: String = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            2950 => {
-                let v: String = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            17 => {
-                let v: Vec<u8> = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            114 | 3802 => {
-                let v: serde_json::Value = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1114 | 1184 => {
-                let v: chrono::NaiveDateTime = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1082 => {
-                let v: chrono::NaiveDate = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1083 => {
-                let v: chrono::NaiveTime = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            1700 => {
-                let v: rust_decimal::Decimal = row.try_get(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-                encoder.encode_field(&v).map_err(|e| PgWireError::ApiError(Box::new(e)))
-            }
-            _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "0A000".into(),
-                oid.to_string(),
-                format!("unsupported column type OID {}", oid),
-            )))),
-        }
+    macro_rules! try_get {
+        ($ty:ty) => {
+            row.try_get::<_, $ty>(idx).map_err(|e| PgWireError::ApiError(Box::new(e)))
+        };
+    }
+
+    macro_rules! encode {
+        ($v:expr) => {
+            encoder.encode_field($v)
+        };
+    }
+
+    match oid {
+        16 => encode!(&try_get!(bool)?),
+        21 => encode!(&try_get!(i16)?),
+        23 => encode!(&try_get!(i32)?),
+        20 => encode!(&try_get!(i64)?),
+        700 => encode!(&try_get!(f32)?),
+        701 => encode!(&try_get!(f64)?),
+        25 | 1043 | 19 | 142 | 705 | 1042 => encode!(&try_get!(String)?),
+        2950 => encode!(&try_get!(String)?),
+        17 => encode!(&try_get!(Vec<u8>)?),
+        114 | 3802 => encode!(&try_get!(serde_json::Value)?),
+        1114 | 1184 => encode!(&try_get!(chrono::NaiveDateTime)?),
+        1082 => encode!(&try_get!(chrono::NaiveDate)?),
+        1083 => encode!(&try_get!(chrono::NaiveTime)?),
+        1700 => encode!(&try_get!(rust_decimal::Decimal)?),
+        _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+            "0A000".into(),
+            oid.to_string(),
+            format!("unsupported column type OID {}", oid),
+        )))),
     }
 }
 
@@ -582,18 +485,11 @@ pub struct StatementWithSql {
 pub struct PostgresQueryParser {
     session: Arc<Session>,
     manager: Arc<ConnectionManager>,
-    /// Maps statement name → original SQL (for DML verb detection).
-    /// Uses tokio::sync::Mutex so lookups work inside async blocks.
-    sql_by_name: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl PostgresQueryParser {
     pub fn new(session: Arc<Session>, manager: Arc<ConnectionManager>) -> Self {
-        Self {
-            session,
-            manager,
-            sql_by_name: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-        }
+        Self { session, manager }
     }
 }
 
@@ -643,8 +539,9 @@ impl QueryParser for PostgresQueryParser {
             })
             .collect();
 
+        // Capture result first, restore backend before propagating.
+        // This prevents connection leaks when prepare_typed fails.
         let result = backend.prepare_typed(query, &types).await;
-
         {
             let mut guard = self.session.inner.lock().await;
             if guard.is_none() {
@@ -654,11 +551,6 @@ impl QueryParser for PostgresQueryParser {
 
         let stmt = result.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
         let sql_owned = query.to_owned();
-
-        // Store SQL keyed by statement name for later DML verb lookup.
-        // The statement name (empty for unnamed) is used as the key.
-        // NOTE: we store by query string as key since statement name is empty for unnamed.
-        self.sql_by_name.lock().await.insert(query.to_owned(), sql_owned.clone());
 
         Ok(StatementWithSql { inner: stmt, sql: sql_owned })
     }
@@ -739,15 +631,7 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
         let stmt = &sws.inner;
         let sql = &sws.sql;
 
-        let is_dml = {
-            let upper = sql.trim_start().to_uppercase();
-            upper.starts_with("INSERT")
-                || upper.starts_with("UPDATE")
-                || upper.starts_with("DELETE")
-                || upper.starts_with("MERGE")
-                || upper.starts_with("TRUNCATE")
-                || upper.starts_with("VACUUM")
-        };
+        let is_dml = parse_dml_verb(sql) != "OK";
 
         let param_types = stmt.params();
         let param_format = portal.parameter_format.clone();
@@ -789,29 +673,58 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
             }
         };
 
-        // Execute query while holding backend. Since do_query is async,
-        // 'backend' lives in the do_query future's state and is valid
-        // for the full duration. We restore it before the function returns.
-        let query_data = if inner_stmt.columns().is_empty() || is_dml {
-            let n = backend
+        // Execute query while holding backend. IMPORTANT: `execute_raw`/`query_raw`
+        // return a value (not a future) — we can capture the result, restore the backend,
+        // then propagate. This avoids the `?` short-circuiting before restore.
+        //
+        // This is the key fix for the connection-leak-on-error bug: all error paths
+        // now restore `backend` to the session before returning.
+        let query_data_result: QueryExecResult = if inner_stmt.columns().is_empty() || is_dml {
+            // DML: capture result first, restore, then propagate
+            let raw_result = backend
                 .execute_raw(&inner_stmt, raw_params.iter())
                 .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let verb = parse_dml_verb(&sql_owned);
-            QueryExecResult::Dml {
-                rows_affected: n as usize,
-                verb: verb.to_string(),
+                .map_err(|e| PgWireError::ApiError(Box::new(e)));
+            // Restore backend before propagating error
+            {
+                let mut guard = self.session.inner.lock().await;
+                if guard.is_none() {
+                    *guard = Some(backend);
+                }
+            }
+            // Now propagate if error, otherwise build Dml result
+            match raw_result {
+                Ok(n) => {
+                    let verb = parse_dml_verb(&sql_owned);
+                    QueryExecResult::Dml {
+                        rows_affected: n as usize,
+                        verb: verb.to_string(),
+                    }
+                }
+                Err(e) => return Err(e),
             }
         } else {
-            let row_stream = backend
+            // SELECT: collect rows into owned Vec<DataRow>
+            let raw_stream_result = backend
                 .query_raw(&inner_stmt, raw_params.iter())
                 .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+                .map_err(|e| PgWireError::ApiError(Box::new(e)));
+            // Restore backend before propagating
+            {
+                let mut guard = self.session.inner.lock().await;
+                if guard.is_none() {
+                    *guard = Some(backend);
+                }
+            }
+            let row_stream = match raw_stream_result {
+                Ok(rs) => rs,
+                Err(e) => return Err(e),
+            };
 
-            let rows: Vec<tokio_postgres::Row> = row_stream
-                .try_collect()
-                .await
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            let rows: Vec<tokio_postgres::Row> = match row_stream.try_collect().await {
+                Ok(r) => r,
+                Err(e) => return Err(PgWireError::ApiError(Box::new(e))),
+            };
 
             let columns = inner_stmt.columns();
             let result_formats: Vec<FieldFormat> = (0..columns.len())
@@ -835,26 +748,11 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
 
             let mut data_rows = Vec::with_capacity(rows.len());
             for row in &rows {
-                let row_encoder_fields: Vec<FieldInfo> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col)| {
-                        FieldInfo::new(
-                            col.name().to_string(),
-                            None,
-                            None,
-                            Type::from_oid(col.type_().oid())
-                                .unwrap_or(Type::UNKNOWN),
-                            *result_formats.get(i).unwrap_or(&FieldFormat::Text),
-                        )
-                    })
-                    .collect();
-                let mut encoder = DataRowEncoder::new(Arc::new(row_encoder_fields));
+                let mut encoder = DataRowEncoder::new(Arc::new(fields.clone()));
 
                 for (col_idx, _col) in columns.iter().enumerate() {
                     let oid = columns[col_idx].type_().oid();
-                    let fmt = *result_formats.get(col_idx).unwrap_or(&FieldFormat::Text);
-                    encode_column_value(row, col_idx, oid, fmt, &mut encoder)?;
+                    encode_column_value(row, col_idx, oid, &mut encoder)?;
                 }
                 data_rows.push(encoder.take_row());
             }
@@ -866,16 +764,8 @@ impl ExtendedQueryHandler for ProxyQueryHandler {
             }
         };
 
-        // Restore backend to session
-        {
-            let mut guard = self.session.inner.lock().await;
-            if guard.is_none() {
-                *guard = Some(backend);
-            }
-        }
-
-        // Build Response from owned query_data
-        let result = match query_data {
+        // Build Response from owned query_data_result
+        let result = match query_data_result {
             QueryExecResult::Dml { rows_affected, verb } => {
                 Response::Execution(Tag::new(&verb).with_rows(rows_affected))
             }
@@ -1119,5 +1009,164 @@ mod tests {
             parse_dml_verb("WITH t AS (SELECT 1) DELETE FROM users WHERE x = 1"),
             "DELETE"
         );
+    }
+
+    // ── decode_text_param ─────────────────────────────────────────────────
+
+    use bytes::BytesMut;
+
+    fn round_trip_text_param(text: &str, oid: u32) -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> {
+        let text_bytes = text.as_bytes();
+        let ty = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        let target = Type::from_oid(oid).unwrap_or(Type::UNKNOWN);
+        let mut out = BytesMut::new();
+        decode_text_param(text_bytes, &ty, &target, &mut out)?;
+        Ok(out.freeze())
+    }
+
+    #[test]
+    fn test_decode_text_bool() {
+        for (input, expected) in [("t", true), ("true", true), ("1", true), ("yes", true), ("on", true),
+                                   ("f", false), ("false", false), ("0", false), ("no", false), ("off", false)] {
+            let result = round_trip_text_param(input, 16).unwrap();
+            let ty = Type::from_oid(16).unwrap();
+            let restored: bool = <bool as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+            assert_eq!(restored, expected, "input={}", input);
+        }
+    }
+
+    #[test]
+    fn test_decode_text_int2() {
+        for (input, expected) in [("0", 0i16), ("1", 1i16), ("-1", -1i16), ("32767", 32767i16)] {
+            let result = round_trip_text_param(input, 21).unwrap();
+            let ty = Type::from_oid(21).unwrap();
+            let restored: i16 = <i16 as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+            assert_eq!(restored, expected, "input={}", input);
+        }
+    }
+
+    #[test]
+    fn test_decode_text_int4() {
+        for (input, expected) in [("0", 0i32), ("42", 42i32), ("-100", -100i32)] {
+            let result = round_trip_text_param(input, 23).unwrap();
+            let ty = Type::from_oid(23).unwrap();
+            let restored: i32 = <i32 as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+            assert_eq!(restored, expected, "input={}", input);
+        }
+    }
+
+    #[test]
+    fn test_decode_text_int8() {
+        for (input, expected) in [("0", 0i64), ("9223372036854775807", 9223372036854775807i64)] {
+            let result = round_trip_text_param(input, 20).unwrap();
+            let ty = Type::from_oid(20).unwrap();
+            let restored: i64 = <i64 as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+            assert_eq!(restored, expected, "input={}", input);
+        }
+    }
+
+    #[test]
+    fn test_decode_text_float4() {
+        let result = round_trip_text_param("3.14", 700).unwrap();
+        let ty = Type::from_oid(700).unwrap();
+        let restored: f32 = <f32 as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert!((restored - std::f32::consts::PI).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_decode_text_float8() {
+        let result = round_trip_text_param("3.14159265358979", 701).unwrap();
+        let ty = Type::from_oid(701).unwrap();
+        let restored: f64 = <f64 as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert!((restored - std::f64::consts::PI).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_decode_text_text() {
+        let result = round_trip_text_param("hello world", 25).unwrap();
+        let ty = Type::from_oid(25).unwrap();
+        let restored: String = <String as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored, "hello world");
+    }
+
+    #[test]
+    fn test_decode_text_text_with_special_chars() {
+        for input in ["O'Brien", "a\\b", "multi\nline", "trailing\t"] {
+            let result = round_trip_text_param(input, 25).unwrap();
+            let ty = Type::from_oid(25).unwrap();
+            let restored: String = <String as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+            assert_eq!(restored, input, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn test_decode_text_uuid() {
+        let input = "550e8400-e29b-41d4-a716-446655440000";
+        let result = round_trip_text_param(input, 2950).unwrap();
+        let ty = Type::from_oid(2950).unwrap();
+        let restored: uuid::Uuid = <uuid::Uuid as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored.to_string(), input);
+    }
+
+    #[test]
+    fn test_decode_text_uuid_invalid() {
+        let result = round_trip_text_param("not-a-uuid", 2950);
+        assert!(result.is_err(), "invalid UUID should return error");
+    }
+
+    #[test]
+    fn test_decode_text_numeric() {
+        let input = "123.45";
+        let result = round_trip_text_param(input, 1700).unwrap();
+        let ty = Type::from_oid(1700).unwrap();
+        let restored: rust_decimal::Decimal = <rust_decimal::Decimal as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored.to_string(), "123.45");
+    }
+
+    #[test]
+    fn test_decode_text_numeric_invalid() {
+        let result = round_trip_text_param("not-a-number", 1700);
+        assert!(result.is_err(), "invalid numeric should return error");
+    }
+
+    #[test]
+    fn test_decode_text_json() {
+        let input = r#"{"key":"value","num":42}"#;
+        let result = round_trip_text_param(input, 114).unwrap();
+        let ty = Type::from_oid(114).unwrap();
+        let restored: serde_json::Value = <serde_json::Value as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored["key"], "value");
+        assert_eq!(restored["num"], 42);
+    }
+
+    #[test]
+    fn test_decode_text_datetime() {
+        let input = "2024-01-15 10:30:00";
+        let result = round_trip_text_param(input, 1114).unwrap();
+        let ty = Type::from_oid(1114).unwrap();
+        let restored: chrono::NaiveDateTime = <chrono::NaiveDateTime as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored.date().to_string(), "2024-01-15");
+    }
+
+    #[test]
+    fn test_decode_text_datetime_with_microseconds() {
+        let input = "2024-01-15 10:30:00.123456";
+        let result = round_trip_text_param(input, 1114).unwrap();
+        let ty = Type::from_oid(1114).unwrap();
+        let restored: chrono::NaiveDateTime = <chrono::NaiveDateTime as postgres_types::FromSql>::from_sql(&ty, &result).unwrap();
+        assert_eq!(restored.date().to_string(), "2024-01-15");
+    }
+
+    #[test]
+    fn test_decode_text_datetime_invalid() {
+        let result = round_trip_text_param("not-a-datetime", 1114);
+        assert!(result.is_err(), "invalid datetime should return error");
+    }
+
+    #[test]
+    fn test_decode_text_unknown_oid_falls_back_to_string() {
+        // OID 12345 is not in our known set — falls back to text encoding
+        let result = round_trip_text_param("fallback value", 12345);
+        assert!(result.is_ok(), "unknown OID should fall back to string");
     }
 }
