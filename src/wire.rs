@@ -253,6 +253,92 @@ where
     Ok(())
 }
 
+/// Write a SASL InitialResponse ('p' message) carrying the chosen mechanism
+/// name and the client-first message body.
+///
+/// Wire format: `'p' | u32 length | mechanism bytes | 0u8 | i32 initial_len | initial bytes`
+/// (initial_len = -1 if `initial` is empty.)
+pub async fn write_sasl_initial_response<S>(
+    stream: &mut S,
+    mechanism: &str,
+    initial: &[u8],
+) -> Result<(), ProxyError>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let mut buf = Vec::with_capacity(1 + 4 + mechanism.len() + 1 + 4 + initial.len());
+    buf.push(b'p');
+    let body_len: u32 = (4 + mechanism.len() + 1 + 4 + initial.len()) as u32;
+    buf.extend_from_slice(&body_len.to_be_bytes());
+    buf.extend_from_slice(mechanism.as_bytes());
+    buf.push(0);
+    if initial.is_empty() {
+        buf.extend_from_slice(&(-1i32).to_be_bytes());
+    } else {
+        buf.extend_from_slice(&(initial.len() as i32).to_be_bytes());
+        buf.extend_from_slice(initial);
+    }
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Write a SASL Response ('p' message) carrying the client-final message body.
+///
+/// Wire format: `'p' | u32 length | data bytes`
+pub async fn write_sasl_response<S>(stream: &mut S, data: &[u8]) -> Result<(), ProxyError>
+where
+    S: AsyncWriteExt + Unpin,
+{
+    let mut buf = Vec::with_capacity(1 + 4 + data.len());
+    buf.push(b'p');
+    let body_len: u32 = (4 + data.len()) as u32;
+    buf.extend_from_slice(&body_len.to_be_bytes());
+    buf.extend_from_slice(data);
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Read a backend AuthenticationRequest ('R') message and assert its auth_type
+/// matches `expected_type`. Returns the body bytes after the auth_type field.
+///
+/// - type=11 (AuthenticationSASLContinue)
+/// - type=12 (AuthenticationSASLFinal)
+/// - type=0  (AuthenticationOk)
+pub async fn read_sasl_auth_message<S>(
+    stream: &mut S,
+    expected_type: u32,
+) -> Result<Vec<u8>, ProxyError>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut tag = [0u8; 1];
+    stream.read_exact(&mut tag).await?;
+    if tag[0] != b'R' {
+        return Err(ProxyError::ProtocolViolation(format!(
+            "expected AuthenticationRequest (R), got {:02x}",
+            tag[0]
+        )));
+    }
+    let len = read_message_length(stream).await?;
+    let mut body = vec![0u8; (len - 4) as usize];
+    stream.read_exact(&mut body).await?;
+    if body.len() < 4 {
+        return Err(ProxyError::ProtocolViolation(
+            "AuthenticationRequest body too short".into(),
+        ));
+    }
+    let auth_type = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if auth_type != expected_type {
+        return Err(ProxyError::ProtocolViolation(format!(
+            "expected SASL auth type {}, got {}",
+            expected_type, auth_type
+        )));
+    }
+    Ok(body[4..].to_vec())
+}
+
 /// Write a Query message ('Q').
 pub async fn write_query<S>(stream: &mut S, sql: &str) -> Result<(), ProxyError>
 where
@@ -435,5 +521,92 @@ fn split_null(slice: &[u8]) -> (&[u8], &[u8]) {
     match slice.iter().position(|&b| b == 0) {
         Some(pos) => (&slice[..pos], &slice[pos + 1..]),
         None => (slice, &[][..]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper for tests — wraps a byte slice and implements Unpin + AsyncReadExt
+    struct SliceReader<'a>(&'a [u8]);
+    impl tokio::io::AsyncRead for SliceReader<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            let remaining = self.0.len();
+            if remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let chunk = std::cmp::min(buf.remaining(), remaining);
+            buf.put_slice(&self.0[..chunk]);
+            self.0 = &self.0[chunk..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_sasl_initial_response_layout() {
+        let mut buf = Vec::new();
+        write_sasl_initial_response(&mut buf, "SCRAM-SHA-256", b"hello")
+            .await
+            .unwrap();
+        // Expected: 'p' | u32(4 + 13 + 1 + 4 + 5) = 27 | "SCRAM-SHA-256" | 0 | i32(5) | "hello"
+        assert_eq!(buf[0], b'p');
+        assert_eq!(&buf[1..5], &27u32.to_be_bytes());
+        assert_eq!(&buf[5..18], b"SCRAM-SHA-256");
+        assert_eq!(buf[18], 0);
+        assert_eq!(&buf[19..23], &5i32.to_be_bytes());
+        assert_eq!(&buf[23..28], b"hello");
+    }
+
+    #[tokio::test]
+    async fn write_sasl_response_layout() {
+        let mut buf = Vec::new();
+        write_sasl_response(&mut buf, b"final-msg").await.unwrap();
+        // Expected: 'p' | u32(4 + 9) = 13 | "final-msg"
+        assert_eq!(buf[0], b'p');
+        assert_eq!(&buf[1..5], &13u32.to_be_bytes());
+        assert_eq!(&buf[5..14], b"final-msg");
+    }
+
+    #[tokio::test]
+    async fn write_sasl_initial_response_empty_initial() {
+        let mut buf = Vec::new();
+        write_sasl_initial_response(&mut buf, "SCRAM-SHA-256", b"")
+            .await
+            .unwrap();
+        // Expected: 'p' | u32(4 + 13 + 1 + 4) = 22 | "SCRAM-SHA-256" | 0 | i32(-1)
+        assert_eq!(buf[0], b'p');
+        assert_eq!(&buf[1..5], &22u32.to_be_bytes());
+        assert_eq!(&buf[5..18], b"SCRAM-SHA-256");
+        assert_eq!(buf[18], 0);
+        assert_eq!(&buf[19..23], &(-1i32).to_be_bytes());
+        assert_eq!(buf.len(), 23);
+    }
+
+    #[tokio::test]
+    async fn read_sasl_auth_message_wrong_tag() {
+        // SliceReader wraps a byte slice and implements Unpin + AsyncReadExt
+        let result = read_sasl_auth_message(&mut SliceReader(&[b'E'][..]), 11).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected AuthenticationRequest (R)"));
+    }
+
+    #[tokio::test]
+    async fn read_sasl_auth_message_type_mismatch() {
+        // 'R' | u32(len=8) | u32(auth_type=5) — we ask for type 11, should mismatch
+        let result =
+            read_sasl_auth_message(&mut SliceReader(&[b'R', 0, 0, 0, 8, 0, 0, 0, 5][..]), 11).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected SASL auth type 11, got 5"));
     }
 }

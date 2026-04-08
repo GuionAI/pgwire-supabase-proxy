@@ -7,7 +7,6 @@
 mod auth;
 mod error;
 mod proxy;
-mod scram;
 mod wire;
 
 // Re-export Config for use by integration tests and main binary.
