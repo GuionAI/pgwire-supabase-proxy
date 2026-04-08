@@ -26,7 +26,7 @@ if nc -z 127.0.0.1 "$LOCAL_PORT" 2>/dev/null; then
 fi
 
 echo "starting kubectl port-forward on 127.0.0.1:$LOCAL_PORT..."
-kubectl port-forward -n "$NAMESPACE" "svc/$SERVICE" "$LOCAL_PORT:5432" &
+kubectl port-forward -n "$NAMESPACE" "svc/$SERVICE" "$LOCAL_PORT:5432" --context orbstack &
 PF_PID=$!
 
 # Wait for port to be open (up to 15s)
