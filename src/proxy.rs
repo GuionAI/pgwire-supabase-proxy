@@ -2,15 +2,12 @@
 
 use crate::auth::{Claims, JwtAuthenticator};
 use crate::error::ProxyError;
-use crate::scram;
 use crate::wire;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-
 
 /// Start the byte-forward proxy server.
 pub async fn serve(
@@ -136,14 +133,20 @@ async fn handle_connection(
     let (backend_host, backend_port, backend_user, backend_password, backend_db) =
         parse_backend_url(&config.backend_postgres_url)?;
 
-    let mut backend = match tokio::net::TcpStream::connect((backend_host.as_str(), backend_port)).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(peer_addr = %peer_addr, error = %e, "backend TCP connect failed");
-            wire::write_error_response(&mut client, "08001", &format!("backend connection failed: {}", e)).await?;
-            return Ok(());
-        }
-    };
+    let mut backend =
+        match tokio::net::TcpStream::connect((backend_host.as_str(), backend_port)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(peer_addr = %peer_addr, error = %e, "backend TCP connect failed");
+                wire::write_error_response(
+                    &mut client,
+                    "08001",
+                    &format!("backend connection failed: {}", e),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
     tracing::debug!(peer_addr = %peer_addr, backend = %backend_host, "backend TCP opened");
 
     // Step 7: Send backend StartupMessage (plain TCP, no TLS)
@@ -164,15 +167,37 @@ async fn handle_connection(
             wire::write_password_message(&mut backend, &backend_password).await?;
         }
         wire::AuthMethod::Sasl { mechanisms } => {
-            if !mechanisms.contains(&"SCRAM-SHA-256".to_string()) {
+            use postgres_protocol::authentication::sasl::{
+                ChannelBinding, ScramSha256, SCRAM_SHA_256,
+            };
+
+            if !mechanisms.iter().any(|m| m.as_str() == SCRAM_SHA_256) {
                 return Err(Box::new(ProxyError::BackendAuth(format!(
                     "unsupported SASL mechanisms: {:?}",
                     mechanisms
                 ))));
             }
-            scram::scram_sha_256_authenticate(&mut backend, &backend_user, &backend_password)
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+            let mut scram =
+                ScramSha256::new(backend_password.as_bytes(), ChannelBinding::unsupported());
+
+            wire::write_sasl_initial_response(&mut backend, SCRAM_SHA_256, scram.message()).await?;
+
+            let server_first = wire::read_sasl_auth_message(&mut backend, 11).await?;
+            scram
+                .update(&server_first)
+                .map_err(|e| ProxyError::BackendAuth(format!("scram update: {}", e)))?;
+
+            wire::write_sasl_response(&mut backend, scram.message()).await?;
+
+            let server_final = wire::read_sasl_auth_message(&mut backend, 12).await?;
+            scram
+                .finish(&server_final)
+                .map_err(|e| ProxyError::BackendAuth(format!("scram finish: {}", e)))?;
+
+            let _ = wire::read_sasl_auth_message(&mut backend, 0).await?;
+
+            tracing::debug!(peer_addr = %peer_addr, "backend SCRAM-SHA-256 auth complete");
         }
         wire::AuthMethod::Md5Password { .. } => {
             return Err(Box::new(ProxyError::BackendAuth(

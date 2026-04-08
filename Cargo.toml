@@ -17,6 +17,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync",
 
 # Wire protocol
 bytes = "1"
+postgres-protocol = "0.6.11"
 
 # Auth
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
@@ -31,13 +32,6 @@ thiserror = "2"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# SCRAM
-hmac = "0.12"
-sha2 = "0.10"
-
-# Base64 (SCRAM)
-base64 = "0.22"
 
 # Random
 rand = "0.8"
