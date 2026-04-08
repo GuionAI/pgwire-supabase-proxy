@@ -165,6 +165,7 @@ async fn handle_connection(
         }
         wire::AuthMethod::CleartextPassword => {
             wire::write_password_message(&mut backend, &backend_password).await?;
+            tracing::debug!(peer_addr = %peer_addr, "backend auth: cleartext password sent");
         }
         wire::AuthMethod::Sasl { mechanisms } => {
             use postgres_protocol::authentication::sasl::{

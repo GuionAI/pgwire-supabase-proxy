@@ -303,8 +303,9 @@ where
 /// Read a backend AuthenticationRequest ('R') message and assert its auth_type
 /// matches `expected_type`. Returns the body bytes after the auth_type field.
 ///
-/// Used to read AuthenticationSASLContinue (type=11), AuthenticationSASLFinal
-/// (type=12), and AuthenticationOk (type=0) during SCRAM exchange.
+/// - type=11 (AuthenticationSASLContinue)
+/// - type=12 (AuthenticationSASLFinal)
+/// - type=0  (AuthenticationOk)
 pub async fn read_sasl_auth_message<S>(
     stream: &mut S,
     expected_type: u32,
@@ -527,6 +528,25 @@ fn split_null(slice: &[u8]) -> (&[u8], &[u8]) {
 mod tests {
     use super::*;
 
+    // Helper for tests — wraps a byte slice and implements Unpin + AsyncReadExt
+    struct SliceReader<'a>(&'a [u8]);
+    impl tokio::io::AsyncRead for SliceReader<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<tokio::io::Result<()>> {
+            let remaining = self.0.len();
+            if remaining == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let chunk = std::cmp::min(buf.remaining(), remaining);
+            buf.put_slice(&self.0[..chunk]);
+            self.0 = &self.0[chunk..];
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     #[tokio::test]
     async fn write_sasl_initial_response_layout() {
         let mut buf = Vec::new();
@@ -565,5 +585,28 @@ mod tests {
         assert_eq!(buf[18], 0);
         assert_eq!(&buf[19..23], &(-1i32).to_be_bytes());
         assert_eq!(buf.len(), 23);
+    }
+
+    #[tokio::test]
+    async fn read_sasl_auth_message_wrong_tag() {
+        // SliceReader wraps a byte slice and implements Unpin + AsyncReadExt
+        let result = read_sasl_auth_message(&mut SliceReader(&[b'E'][..]), 11).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected AuthenticationRequest (R)"));
+    }
+
+    #[tokio::test]
+    async fn read_sasl_auth_message_type_mismatch() {
+        // 'R' | u32(len=8) | u32(auth_type=5) — we ask for type 11, should mismatch
+        let result =
+            read_sasl_auth_message(&mut SliceReader(&[b'R', 0, 0, 0, 8, 0, 0, 0, 5][..]), 11).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expected SASL auth type 11, got 5"));
     }
 }
